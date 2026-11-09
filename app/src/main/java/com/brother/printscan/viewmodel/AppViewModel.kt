@@ -62,29 +62,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val outEp = usbManager.scanEndpointOut
 
         if (conn == null || inEp == null || outEp == null) {
-            _statusMessage.value = "Printer/Scanner not ready or permission not granted."
+            _statusMessage.value = "Scanner endpoints not ready. Re-plug OTG cable."
+            return
+        }
+
+        // Claim Interface 1 (Scanner) exclusively before initiating bulk transfers
+        val claimed = usbManager.claimScannerInterface()
+        if (!claimed) {
+            _statusMessage.value = "Failed to claim scanner USB interface. Re-plug OTG cable."
             return
         }
 
         viewModelScope.launch {
-            _isBusy.value = true
-            _statusMessage.value = "Scanning flatbed at ${resolution.dpi} DPI..."
-            _operationProgress.value = 0
+            try {
+                _isBusy.value = true
+                _statusMessage.value = "Scanning flatbed at ${resolution.dpi} DPI..."
+                _operationProgress.value = 0
 
-            val protocol = BrotherScanProtocol(conn, inEp, outEp)
-            val bitmap = protocol.performScan(resolution, mode) { progress ->
-                _operationProgress.value = progress
+                val protocol = BrotherScanProtocol(conn, inEp, outEp)
+                val bitmap = protocol.performScan(resolution, mode) { progress ->
+                    _operationProgress.value = progress
+                }
+
+                if (bitmap != null) {
+                    val newPage = ScannedPage(originalBitmap = bitmap, displayBitmap = bitmap)
+                    _scannedPages.value = _scannedPages.value + newPage
+                    _statusMessage.value = "Scan completed successfully!"
+                } else {
+                    _statusMessage.value = "Scan failed or was interrupted."
+                }
+            } finally {
+                usbManager.releaseScannerInterface()
+                _isBusy.value = false
             }
-
-            if (bitmap != null) {
-                val newPage = ScannedPage(originalBitmap = bitmap, displayBitmap = bitmap)
-                _scannedPages.value = _scannedPages.value + newPage
-                _statusMessage.value = "Scan completed successfully!"
-            } else {
-                _statusMessage.value = "Scan failed or was interrupted."
-            }
-
-            _isBusy.value = false
         }
     }
 
@@ -175,18 +185,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val claimed = usbManager.claimPrinterInterface()
+        if (!claimed) {
+            _statusMessage.value = "Failed to claim printer USB interface"
+            return
+        }
+
         viewModelScope.launch {
-            _isBusy.value = true
-            _statusMessage.value = "Sending print job to Brother printer..."
-            _operationProgress.value = 0
+            try {
+                _isBusy.value = true
+                _statusMessage.value = "Sending print job to Brother printer..."
+                _operationProgress.value = 0
 
-            val printProtocol = BrotherPrintProtocol(conn, outEp)
-            val success = printProtocol.printBitmap(bitmap, copies) { progress ->
-                _operationProgress.value = progress
+                val printProtocol = BrotherPrintProtocol(conn, outEp)
+                val success = printProtocol.printBitmap(bitmap, copies) { progress ->
+                    _operationProgress.value = progress
+                }
+
+                _statusMessage.value = if (success) "Print job completed!" else "Print failed"
+            } finally {
+                _isBusy.value = false
             }
-
-            _statusMessage.value = if (success) "Print job completed!" else "Print failed"
-            _isBusy.value = false
         }
     }
 }

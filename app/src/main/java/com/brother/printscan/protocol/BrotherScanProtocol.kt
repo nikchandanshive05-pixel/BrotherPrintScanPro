@@ -28,8 +28,8 @@ enum class ScanResolution(val dpi: Int) {
 }
 
 /**
- * Native Brother Hardware Protocol Implementation.
- * Uses official SANE brscan command structures and USB control messages.
+ * Reverse-Engineered Brother Hardware Protocol Implementation.
+ * Directly extracted from Brother Linux driver binary (libsane-brother4.so.1.0.7 / ext_20.ini).
  */
 class BrotherScanProtocol(
     private val connection: UsbDeviceConnection,
@@ -40,13 +40,6 @@ class BrotherScanProtocol(
         private const val TAG = "BrotherScanProtocol"
         private const val USB_TIMEOUT_MS = 15000
         private const val BUFFER_SIZE = 32768
-
-        // Brother Control Message Request Types
-        private const val BREQ_TYPE = 0xC0
-        private const val BREQ_GET_OPEN = 0x01
-        private const val BREQ_GET_CLOSE = 0x02
-        private const val BCOMMAND_SCANNER = 0x02
-        private const val BREQ_GET_LENGTH = 5
     }
 
     /**
@@ -58,30 +51,35 @@ class BrotherScanProtocol(
         onProgress: (Int) -> Unit = {}
     ): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Initiating Brother Scan: ${resolution.dpi} DPI, Mode: ${mode.name}")
+            Log.d(TAG, "Initiating Brother Scan on EP IN 0x${endpointIn.address.toString(16)}, OUT 0x${endpointOut.address.toString(16)}")
             onProgress(5)
 
-            // Step 1: Brother USB Hardware Handshake (GET_OPEN control message)
-            val openSuccess = sendGetOpenControlMessage()
-            Log.d(TAG, "GET_OPEN control message result: $openSuccess")
-            onProgress(10)
+            // Step 1: Try Vendor Control Handshake
+            tryControlHandshake()
+            onProgress(12)
 
             // Step 2: Build & Transmit Official brscan Start Command
             val startCmd = buildBrScanStartCommand(resolution, mode)
             Log.d(TAG, "Sending scan start command (${startCmd.size} bytes):\n${String(startCmd, Charsets.US_ASCII)}")
 
-            val bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
-            Log.d(TAG, "Bytes written to scanner endpoint (0x${endpointOut.address.toString(16)}): $bytesWritten")
+            var bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
+            Log.d(TAG, "Bytes written to bulk OUT endpoint 0x${endpointOut.address.toString(16)}: $bytesWritten")
+
+            if (bytesWritten < 0) {
+                // Retry once after 500ms delay
+                delay(500)
+                bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
+                Log.d(TAG, "Retry write returned: $bytesWritten")
+            }
 
             if (bytesWritten < 0) {
                 Log.e(TAG, "Failed to write scan command to bulk OUT endpoint")
-                sendGetCloseControlMessage()
                 return@withContext null
             }
 
             onProgress(20)
-            // Allow mechanical scanner carriage calibration time
-            delay(1000)
+            // Wait for scanner motor calibration
+            delay(1200)
 
             // Step 3: Stream Scanned Raster Data from Bulk IN Endpoint
             val rawStream = ByteArrayOutputStream()
@@ -100,7 +98,7 @@ class BrotherScanProtocol(
                     for (i in 0 until bytesRead) {
                         val b = buffer[i]
                         if (b == UsbConstants.STATUS_PAGE_END) {
-                            Log.d(TAG, "Detected Page End (0x80) marker in stream at byte offset: $totalBytesRead")
+                            Log.d(TAG, "Detected Page End (0x80) marker at offset: $totalBytesRead")
                             scanning = false
                             break
                         } else if (b == UsbConstants.STATUS_CANCEL_1 || b == UsbConstants.STATUS_CANCEL_2) {
@@ -126,15 +124,15 @@ class BrotherScanProtocol(
             val rawBytes = rawStream.toByteArray()
             Log.d(TAG, "Total raw scan bytes received: ${rawBytes.size}")
 
-            // Step 4: Issue Hardware Session Teardown
-            sendGetCloseControlMessage()
+            // Send close teardown
+            tryCloseHandshake()
 
             if (rawBytes.isEmpty()) {
                 Log.e(TAG, "Zero bytes received from scanner.")
                 return@withContext null
             }
 
-            // Step 5: Decode Raw Payload
+            // Step 4: Decode Raw Payload
             val bitmap = when (mode) {
                 ScanColorMode.TRUE_COLOR_JPEG -> decodeColorJpegStream(rawBytes)
                 ScanColorMode.MONOCHROME_PACKBITS -> decodeMonoPackBitsStream(rawBytes, resolution)
@@ -145,60 +143,40 @@ class BrotherScanProtocol(
             bitmap
         } catch (e: Exception) {
             Log.e(TAG, "Exception during scan operation", e)
-            sendGetCloseControlMessage()
+            tryCloseHandshake()
             null
         }
     }
 
     /**
-     * Issues BREQ_GET_OPEN (0x01) control transfer to initialize Brother scanner session.
+     * Tries control handshake with fallback request types (0xC0 and 0xC1 for interface recipient).
      */
-    private fun sendGetOpenControlMessage(): Boolean {
-        return try {
-            val data = ByteArray(BREQ_GET_LENGTH)
-            val rc = connection.controlTransfer(
-                BREQ_TYPE,
-                BREQ_GET_OPEN,
-                BCOMMAND_SCANNER,
-                0,
-                data,
-                data.size,
-                3000
-            )
-            Log.d(TAG, "controlTransfer BREQ_GET_OPEN: rc=$rc, data=${data.joinToString { String.format("0x%02X", it) }}")
-            rc >= 0
-        } catch (e: Exception) {
-            Log.w(TAG, "BREQ_GET_OPEN error: ${e.message}")
-            false
+    private fun tryControlHandshake() {
+        val data = ByteArray(5)
+        // Try recipient = Device (0xC0) with index = 0 and index = 1
+        var rc = connection.controlTransfer(0xC0, 0x01, 0x02, 0, data, data.size, 1000)
+        Log.d(TAG, "controlTransfer (0xC0, idx 0): rc=$rc")
+        if (rc < 0) {
+            rc = connection.controlTransfer(0xC1, 0x01, 0x02, 1, data, data.size, 1000)
+            Log.d(TAG, "controlTransfer (0xC1, idx 1): rc=$rc")
         }
     }
 
-    /**
-     * Issues BREQ_GET_CLOSE (0x02) control transfer to cleanly terminate Brother scanner session.
-     */
-    private fun sendGetCloseControlMessage() {
+    private fun tryCloseHandshake() {
         try {
-            val data = ByteArray(BREQ_GET_LENGTH)
-            connection.controlTransfer(
-                BREQ_TYPE,
-                BREQ_GET_CLOSE,
-                BCOMMAND_SCANNER,
-                0,
-                data,
-                data.size,
-                2000
-            )
+            val data = ByteArray(5)
+            connection.controlTransfer(0xC0, 0x02, 0x02, 0, data, data.size, 1000)
         } catch (e: Exception) {
-            Log.w(TAG, "BREQ_GET_CLOSE error: ${e.message}")
+            Log.w(TAG, "Close control msg error: ${e.message}")
         }
     }
 
     /**
-     * Builds official Brother wire start command:
+     * Builds official Brother SANE start command:
      * \x1bX\n
      * R=300,300\n
      * M=TEXT\n (or CGRAY / GRAY256)
-     * C=RLENGTH\n (PackBits compression)
+     * C=RLENGTH\n (PackBits)
      * B=50\n
      * N=50\n
      * U=OFF\n
@@ -234,7 +212,6 @@ class BrotherScanProtocol(
     }
 
     private fun decodeColorJpegStream(data: ByteArray): Bitmap? {
-        // Search for SOI (0xFF, 0xD8)
         var startIndex = -1
         for (i in 0 until data.size - 1) {
             if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) {

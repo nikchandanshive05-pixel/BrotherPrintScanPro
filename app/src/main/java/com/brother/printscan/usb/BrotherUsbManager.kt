@@ -43,14 +43,17 @@ class BrotherUsbManager(private val context: Context) {
     var activeConnection: UsbDeviceConnection? = null
         private set
 
+    var scanInterface: UsbInterface? = null
+        private set
+    var printInterface: UsbInterface? = null
+        private set
+
     var scanEndpointIn: UsbEndpoint? = null
         private set
     var scanEndpointOut: UsbEndpoint? = null
         private set
     var printEndpointOut: UsbEndpoint? = null
         private set
-
-    private val claimedInterfaces = mutableListOf<UsbInterface>()
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -75,11 +78,11 @@ class BrotherUsbManager(private val context: Context) {
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    Log.d(TAG, "USB Device Attached broadcast received")
+                    Log.d(TAG, "USB Device Attached")
                     checkConnectedDevices()
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    Log.d(TAG, "USB Device Detached broadcast received")
+                    Log.d(TAG, "USB Device Detached")
                     disconnect()
                 }
             }
@@ -115,7 +118,6 @@ class BrotherUsbManager(private val context: Context) {
 
         var brotherDevice: UsbDevice? = null
         for (device in deviceList.values) {
-            Log.d(TAG, "Device: VID 0x${device.vendorId.toString(16)} PID 0x${device.productId.toString(16)} Name: ${device.productName}")
             if (device.vendorId == UsbConstants.BROTHER_VENDOR_ID) {
                 brotherDevice = device
                 break
@@ -166,43 +168,40 @@ class BrotherUsbManager(private val context: Context) {
             scanEndpointIn = null
             scanEndpointOut = null
             printEndpointOut = null
-            claimedInterfaces.clear()
+            scanInterface = null
+            printInterface = null
 
             val epSummary = StringBuilder()
 
-            // Enumerate and claim all relevant interfaces
+            // Forensic discovery from ext_20.ini:
+            // DCP-B7500D (PID 0x041b):
+            // Interface 0: Printer (0x01 Bulk OUT, 0x82 Bulk IN)
+            // Interface 1: Scanner (0x03 Bulk OUT, 0x84 Bulk IN)
             for (i in 0 until device.interfaceCount) {
-                val usbInterface = device.getInterface(i)
-                val claimed = connection.claimInterface(usbInterface, true)
-                if (claimed) {
-                    claimedInterfaces.add(usbInterface)
+                val iface = device.getInterface(i)
+                epSummary.append("IF $i (${iface.interfaceClass}): ")
+
+                if (iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER || i == 0) {
+                    printInterface = iface
+                }
+                if (iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPECIFIC || i == 1) {
+                    scanInterface = iface
                 }
 
-                epSummary.append("IF $i (Class ${usbInterface.interfaceClass}): ")
-
-                for (j in 0 until usbInterface.endpointCount) {
-                    val ep = usbInterface.getEndpoint(j)
-                    val epAddr = ep.address
+                for (j in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(j)
                     val isBulk = ep.type == AndroidUsbConstants.USB_ENDPOINT_XFER_BULK
                     val isIn = ep.direction == AndroidUsbConstants.USB_DIR_IN
 
-                    epSummary.append("0x${epAddr.toString(16)} ")
+                    epSummary.append("0x${ep.address.toString(16)} ")
 
                     if (isBulk) {
-                        if (isIn) {
-                            // Brother scanner bulk IN is typically interface 1 or endpoint 0x82/0x84/0x85
-                            if (usbInterface.interfaceClass != UsbConstants.USB_CLASS_PRINTER || scanEndpointIn == null) {
-                                scanEndpointIn = ep
-                            }
+                        if (i == 1 || iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPECIFIC) {
+                            // Scanner interface endpoints
+                            if (isIn) scanEndpointIn = ep else scanEndpointOut = ep
                         } else {
-                            // Bulk OUT
-                            if (usbInterface.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
-                                printEndpointOut = ep
-                            } else {
-                                scanEndpointOut = ep
-                            }
-                            if (printEndpointOut == null) printEndpointOut = ep
-                            if (scanEndpointOut == null) scanEndpointOut = ep
+                            // Printer interface endpoints
+                            if (!isIn) printEndpointOut = ep
                         }
                     }
                 }
@@ -211,7 +210,7 @@ class BrotherUsbManager(private val context: Context) {
 
             val canScan = scanEndpointIn != null && scanEndpointOut != null
             val canPrint = printEndpointOut != null
-            val modelName = device.productName ?: "Brother DCP Series (${String.format("0x%04X", device.productId)})"
+            val modelName = device.productName ?: "Brother DCP-B7500D (0x${device.productId.toString(16)})"
 
             _connectionState.value = UsbConnectionState(
                 isConnected = true,
@@ -222,7 +221,7 @@ class BrotherUsbManager(private val context: Context) {
                 endpointDetails = epSummary.toString(),
                 errorMessage = null
             )
-            Log.d(TAG, "Device ready: $modelName. $epSummary")
+            Log.d(TAG, "Device ready: $modelName. Summary: $epSummary")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize device", e)
             _connectionState.value = UsbConnectionState(
@@ -231,17 +230,46 @@ class BrotherUsbManager(private val context: Context) {
         }
     }
 
+    /**
+     * Claims the scanner interface exclusively for scanning operations.
+     */
+    fun claimScannerInterface(): Boolean {
+        val conn = activeConnection ?: return false
+        val iface = scanInterface ?: return false
+        // Release printer interface if claimed to prevent kernel conflicts
+        printInterface?.let { conn.releaseInterface(it) }
+        return conn.claimInterface(iface, true)
+    }
+
+    /**
+     * Releases scanner interface.
+     */
+    fun releaseScannerInterface() {
+        val conn = activeConnection ?: return
+        scanInterface?.let { conn.releaseInterface(it) }
+    }
+
+    /**
+     * Claims printer interface for printing.
+     */
+    fun claimPrinterInterface(): Boolean {
+        val conn = activeConnection ?: return false
+        val iface = printInterface ?: return false
+        scanInterface?.let { conn.releaseInterface(it) }
+        return conn.claimInterface(iface, true)
+    }
+
     fun disconnect() {
         try {
-            for (iface in claimedInterfaces) {
-                activeConnection?.releaseInterface(iface)
-            }
+            scanInterface?.let { activeConnection?.releaseInterface(it) }
+            printInterface?.let { activeConnection?.releaseInterface(it) }
             activeConnection?.close()
         } catch (e: Exception) {
             Log.w(TAG, "Error closing connection: ${e.message}")
         } finally {
-            claimedInterfaces.clear()
             activeConnection = null
+            scanInterface = null
+            printInterface = null
             scanEndpointIn = null
             scanEndpointOut = null
             printEndpointOut = null
