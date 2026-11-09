@@ -16,7 +16,7 @@ import java.io.ByteArrayOutputStream
  */
 enum class ScanColorMode(val code: String) {
     MONOCHROME_PACKBITS("TEXT"),
-    GRAYSCALE("GRAY256"),
+    GRAYSCALE("GRAY64"),
     TRUE_COLOR_JPEG("CGRAY")
 }
 
@@ -25,6 +25,11 @@ enum class ScanResolution(val dpi: Int) {
     DPI_200(200),
     DPI_300(300),
     DPI_600(600)
+}
+
+sealed class ScanResult {
+    data class Success(val bitmap: Bitmap) : ScanResult()
+    data class Failure(val error: String) : ScanResult()
 }
 
 /**
@@ -38,14 +43,14 @@ class BrotherScanProtocol(
 ) {
     companion object {
         private const val TAG = "BrotherScanProtocol"
-        private const val USB_TIMEOUT_MS = 15000
+        private const val USB_TIMEOUT_MS = 20000
         private const val BUFFER_SIZE = 32768
     }
 
     /**
      * Executes scan session with hardware handshaking, command transmission, and stream reception.
      * Follows the exact SANE brother4 sequence reverse-engineered from libsane-brother4.so.1.0.7:
-     * 1. Handshake Loop: 0xC0 BREQ_GET_OPEN with recovery 0xC0 BREQ_GET_CLOSE + Q-Command proc.
+     * 1. Handshake Loop: 0xC0 BREQ_GET_OPEN with recovery 0xC0 BREQ_GET_CLOSE.
      * 2. Parameter Negotiation: Sends \x1bI\n query command and reads scanner response.
      * 3. Start Command: Transmits \x1bX\n scan command to Endpoint 0x03.
      * 4. Raster Reception: Streams data from Bulk IN Endpoint 0x84 until 0x80 Page End marker.
@@ -55,7 +60,7 @@ class BrotherScanProtocol(
         resolution: ScanResolution = ScanResolution.DPI_300,
         mode: ScanColorMode = ScanColorMode.TRUE_COLOR_JPEG,
         onProgress: (Int) -> Unit = {}
-    ): Bitmap? = withContext(Dispatchers.IO) {
+    ): ScanResult = withContext(Dispatchers.IO) {
         try {
             Log.d(TAG, "Initiating Brother Scan: ${resolution.dpi} DPI, Mode: $mode on OUT 0x${endpointOut.address.toString(16)}, IN 0x${endpointIn.address.toString(16)}")
             onProgress(5)
@@ -77,21 +82,23 @@ class BrotherScanProtocol(
             Log.d(TAG, "Bytes written to bulk OUT endpoint 0x${endpointOut.address.toString(16)}: $bytesWritten")
 
             if (bytesWritten < 0) {
-                // Retry once after 300ms delay
+                // Clear halt on endpoint and retry once
+                clearEndpointHalt(endpointOut.address)
                 delay(300)
                 bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
                 Log.d(TAG, "Retry write returned: $bytesWritten")
             }
 
             if (bytesWritten < 0) {
-                Log.e(TAG, "Failed to write scan command to bulk OUT endpoint")
+                val err = "Failed to write scan command to bulk OUT 0x${endpointOut.address.toString(16)} (rc=$bytesWritten)"
+                Log.e(TAG, err)
                 tryCloseHandshake()
-                return@withContext null
+                return@withContext ScanResult.Failure(err)
             }
 
             onProgress(25)
-            // Wait 1.5s for scanner mechanical motor initialization and lamp calibration
-            delay(1500)
+            // Wait for scanner mechanical carriage motor initialization and lamp calibration
+            delay(1200)
 
             // Step 4: Stream Scanned Raster Data from Bulk IN Endpoint
             val rawStream = ByteArrayOutputStream()
@@ -125,8 +132,8 @@ class BrotherScanProtocol(
                     onProgress(currentProgress)
                 } else {
                     emptyReads++
-                    Log.d(TAG, "Bulk read returned $bytesRead (empty streak: $emptyReads)")
-                    if (emptyReads > 3 || totalBytesRead > 0) {
+                    Log.d(TAG, "Bulk read returned $bytesRead (empty streak: $emptyReads, total read: $totalBytesRead)")
+                    if (emptyReads > 3 || (totalBytesRead > 0 && bytesRead <= 0)) {
                         scanning = false
                     }
                 }
@@ -140,8 +147,9 @@ class BrotherScanProtocol(
             tryCloseHandshake()
 
             if (rawBytes.isEmpty()) {
-                Log.e(TAG, "Zero bytes received from scanner.")
-                return@withContext null
+                val err = "Zero bytes received from scanner on IN 0x${endpointIn.address.toString(16)}"
+                Log.e(TAG, err)
+                return@withContext ScanResult.Failure(err)
             }
 
             // Step 6: Decode Raw Payload
@@ -151,12 +159,19 @@ class BrotherScanProtocol(
                 ScanColorMode.GRAYSCALE -> decodeGrayscaleStream(rawBytes, resolution)
             }
 
+            if (bitmap == null) {
+                val err = "Failed to decode ${rawBytes.size} bytes into image ($mode)"
+                Log.e(TAG, err)
+                return@withContext ScanResult.Failure(err)
+            }
+
             onProgress(100)
-            bitmap
+            ScanResult.Success(bitmap)
         } catch (e: Exception) {
-            Log.e(TAG, "Exception during scan operation", e)
+            val err = "Scan exception: ${e.message ?: e.javaClass.simpleName}"
+            Log.e(TAG, err, e)
             tryCloseHandshake()
-            null
+            ScanResult.Failure(err)
         }
     }
 
@@ -166,14 +181,11 @@ class BrotherScanProtocol(
      *   controlTransfer(0xC0 or 0xC1, 0x01, 0x02, 0 or 1, buf, 5, 2000)
      *   Check header: buf[0] == 5, buf[1] == 0x10, buf[2] == 1, buf[3..4] == 2
      *   If not matching:
-     *     controlTransfer(0xC0, 0x02, 0x02, 0, buf, 5, 2000)
-     *     delay(500)
-     *     Send Q-Command '\x1bQ\n\x80' to Bulk OUT
-     *     Read response from Bulk IN
+     *     controlTransfer(0xC0, 0x02, 0x02, 0, buf, 5, 1000)
+     *     delay(300)
      */
     private suspend fun performDriverHandshakeLoop(): Boolean {
         val openBuf = ByteArray(5)
-        val qCmd = byteArrayOf(0x1B, 0x51, 0x0A, 0x80.toByte()) // \x1bQ\n\x80
 
         for (retry in 0..4) {
             // First try 0xC0 (Device recipient, index 0)
@@ -192,19 +204,21 @@ class BrotherScanProtocol(
 
                 if (b0 == 5 && b1 == 0x10 && b2 == 1 && wVal == 2) {
                     Log.d(TAG, "Handshake successful! Scanner ready.")
+                    // Fast non-blocking drain of leftover buffer
+                    val drainBuf = ByteArray(512)
+                    val drained = connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 100)
+                    if (drained > 0) {
+                        Log.d(TAG, "Drained $drained residual bytes from IN endpoint.")
+                        val qCmd = byteArrayOf(0x1B, 0x51, 0x0A, 0x80.toByte())
+                        connection.bulkTransfer(endpointOut, qCmd, qCmd.size, 1000)
+                    }
                     return true
                 }
             }
 
-            // Recovery branch: Send BREQ_GET_CLOSE and Q-command
-            connection.controlTransfer(0xC0, 0x02, 0x02, 0, openBuf, openBuf.size, 2000)
+            // Recovery branch from libsane-brother4: Send BREQ_GET_CLOSE and wait 300ms
+            connection.controlTransfer(0xC0, 0x02, 0x02, 0, openBuf, openBuf.size, 1000)
             delay(300)
-
-            // Send Q-command to bulk OUT and drain response from bulk IN
-            connection.bulkTransfer(endpointOut, qCmd, qCmd.size, 2000)
-            val drainBuf = ByteArray(512)
-            connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 1000)
-            delay(100)
         }
 
         return false
@@ -221,13 +235,21 @@ class BrotherScanProtocol(
             Log.d(TAG, "Parameter negotiation query (\u001BI) written: $written bytes")
 
             val responseBuf = ByteArray(512)
-            val bytesRead = connection.bulkTransfer(endpointIn, responseBuf, responseBuf.size, 2000)
+            val bytesRead = connection.bulkTransfer(endpointIn, responseBuf, responseBuf.size, 1500)
             if (bytesRead > 0) {
                 val responseStr = String(responseBuf, 0, bytesRead, Charsets.US_ASCII)
                 Log.d(TAG, "Parameter negotiation response ($bytesRead bytes): $responseStr")
             }
         } catch (e: Exception) {
             Log.w(TAG, "Parameter negotiation error (non-fatal): ${e.message}")
+        }
+    }
+
+    private fun clearEndpointHalt(endpointAddress: Int) {
+        try {
+            connection.controlTransfer(0x02, 0x01, 0x00, endpointAddress, null, 0, 1000)
+        } catch (e: Exception) {
+            Log.w(TAG, "clearEndpointHalt error: ${e.message}")
         }
     }
 
@@ -241,17 +263,13 @@ class BrotherScanProtocol(
     }
 
     /**
-     * Builds official Brother SANE start command:
-     * \x1bX\n
-     * R=300,300\n
-     * M=TEXT\n (or CGRAY / GRAY256)
-     * C=RLENGTH\n (PackBits)
-     * B=50\n
-     * N=50\n
-     * U=OFF\n
-     * P=OFF\n
-     * A=0,0,2481,3507\n
-     * \x80
+     * Builds official Brother SANE start command verified against libsane-brother4 MakeupScanStartCmd:
+     * Color:
+     *   \x1bX\n R=300,300\n M=CGRAY\n C=JPEG\n J=MID\n B=50\n N=50\n A=0,0,2481,3507\n \x80
+     * B&W:
+     *   \x1bX\n R=300,300\n M=TEXT\n C=RLENGTH\n B=50\n N=50\n A=0,0,2481,3507\n \x80
+     * Grayscale:
+     *   \x1bX\n R=300,300\n M=GRAY64\n C=RLENGTH\n B=50\n N=50\n A=0,0,2481,3507\n \x80
      */
     private fun buildBrScanStartCommand(resolution: ScanResolution, mode: ScanColorMode): ByteArray {
         val dpi = resolution.dpi
@@ -259,13 +277,26 @@ class BrotherScanProtocol(
         val dotsX = (8.27f * dpi).toInt()
         val dotsY = (11.69f * dpi).toInt()
 
-        val compression = if (mode == ScanColorMode.MONOCHROME_PACKBITS) "RLENGTH" else "NONE"
-
         val sb = StringBuilder()
         sb.append("\u001BX\n")
         sb.append("R=$dpi,$dpi\n")
-        sb.append("M=${mode.code}\n")
-        sb.append("C=$compression\n")
+
+        when (mode) {
+            ScanColorMode.TRUE_COLOR_JPEG -> {
+                sb.append("M=CGRAY\n")
+                sb.append("C=JPEG\n")
+                sb.append("J=MID\n")
+            }
+            ScanColorMode.MONOCHROME_PACKBITS -> {
+                sb.append("M=TEXT\n")
+                sb.append("C=RLENGTH\n")
+            }
+            ScanColorMode.GRAYSCALE -> {
+                sb.append("M=GRAY64\n")
+                sb.append("C=RLENGTH\n")
+            }
+        }
+
         sb.append("B=50\n")
         sb.append("N=50\n")
         sb.append("A=0,0,$dotsX,$dotsY\n")

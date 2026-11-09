@@ -80,16 +80,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 val protocol = BrotherScanProtocol(conn, inEp, outEp)
-                val bitmap = protocol.performScan(resolution, mode) { progress ->
+                val result = protocol.performScan(resolution, mode) { progress ->
                     _operationProgress.value = progress
                 }
 
-                if (bitmap != null) {
-                    val newPage = ScannedPage(originalBitmap = bitmap, displayBitmap = bitmap)
-                    _scannedPages.value = _scannedPages.value + newPage
-                    _statusMessage.value = "Scan completed successfully!"
-                } else {
-                    _statusMessage.value = "Scan failed or was interrupted."
+                when (result) {
+                    is com.brother.printscan.protocol.ScanResult.Success -> {
+                        val newPage = ScannedPage(originalBitmap = result.bitmap, displayBitmap = result.bitmap)
+                        _scannedPages.value = _scannedPages.value + newPage
+                        _statusMessage.value = "Scan completed successfully!"
+                    }
+                    is com.brother.printscan.protocol.ScanResult.Failure -> {
+                        _statusMessage.value = result.error
+                    }
                 }
             } finally {
                 usbManager.releaseScannerInterface()

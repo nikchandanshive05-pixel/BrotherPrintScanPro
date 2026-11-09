@@ -113,6 +113,27 @@ fun ScannerScreen(
                     Text("$progress% - ${statusMessage ?: "Scanning..."}")
                 }
             }
+        } else if (!statusMessage.isNullOrBlank()) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (statusMessage.contains("success", ignoreCase = true))
+                        MaterialTheme.colorScheme.primaryContainer
+                    else
+                        MaterialTheme.colorScheme.errorContainer
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(
+                    text = statusMessage,
+                    modifier = Modifier.padding(16.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (statusMessage.contains("success", ignoreCase = true))
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    else
+                        MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
         }
 
         Spacer(Modifier.weight(1f))

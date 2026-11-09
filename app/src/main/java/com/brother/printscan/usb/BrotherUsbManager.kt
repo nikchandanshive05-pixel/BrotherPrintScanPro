@@ -196,12 +196,13 @@ class BrotherUsbManager(private val context: Context) {
                     epSummary.append("0x${ep.address.toString(16)} ")
 
                     if (isBulk) {
-                        if (i == 1 || iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPECIFIC) {
-                            // Scanner interface endpoints
-                            if (isIn) scanEndpointIn = ep else scanEndpointOut = ep
-                        } else {
-                            // Printer interface endpoints
-                            if (!isIn) printEndpointOut = ep
+                        // Match DCP-B7500D endpoints specifically (ext_20.ini: 132=0x84 IN, 3=0x03 OUT)
+                        if (ep.address == 0x84 || (i == 1 && isIn)) {
+                            scanEndpointIn = ep
+                        } else if (ep.address == 0x03 || (i == 1 && !isIn)) {
+                            scanEndpointOut = ep
+                        } else if (ep.address == 0x01 || (i == 0 && !isIn)) {
+                            printEndpointOut = ep
                         }
                     }
                 }
@@ -254,13 +255,15 @@ class BrotherUsbManager(private val context: Context) {
     }
 
     /**
-     * Claims the scanner interface exclusively for scanning operations.
+     * Claims both printer interface (0) and scanner interface (1).
+     * Interface 0 ownership is required by Android kernel usbfs to permit
+     * USB_RECIP_DEVICE vendor control requests (0xC0).
      */
     fun claimScannerInterface(): Boolean {
         val conn = activeConnection ?: return false
         val iface = scanInterface ?: return false
-        // Release printer interface if claimed to prevent kernel conflicts
-        printInterface?.let { conn.releaseInterface(it) }
+        // Claim interface 0 first so usbfs grants device-level control permissions
+        printInterface?.let { conn.claimInterface(it, true) }
         return conn.claimInterface(iface, true)
     }
 
@@ -278,7 +281,6 @@ class BrotherUsbManager(private val context: Context) {
     fun claimPrinterInterface(): Boolean {
         val conn = activeConnection ?: return false
         val iface = printInterface ?: return false
-        scanInterface?.let { conn.releaseInterface(it) }
         return conn.claimInterface(iface, true)
     }
 
