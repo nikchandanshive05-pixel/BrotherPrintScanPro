@@ -5,7 +5,6 @@ import android.graphics.BitmapFactory
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.util.Log
-import com.brother.printscan.usb.UsbConstants
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -43,7 +42,6 @@ class BrotherScanProtocol(
 ) {
     companion object {
         private const val TAG = "BrotherScanProtocol"
-        private const val USB_TIMEOUT_MS = 20000
         private const val BUFFER_SIZE = 32768
     }
 
@@ -51,10 +49,12 @@ class BrotherScanProtocol(
      * Executes scan session with hardware handshaking, command transmission, and stream reception.
      * Follows the exact SANE brother4 sequence reverse-engineered from libsane-brother4.so.1.0.7:
      * 1. Handshake Loop: 0xC0 BREQ_GET_OPEN with recovery 0xC0 BREQ_GET_CLOSE.
-     * 2. Parameter Negotiation: Sends \x1bI\n query command and reads scanner response.
-     * 3. Start Command: Transmits \x1bX\n scan command to Endpoint 0x03.
-     * 4. Raster Reception: Streams data from Bulk IN Endpoint 0x84 until 0x80 Page End marker.
-     * 5. Session Teardown: Sends 0xC0 BREQ_GET_CLOSE.
+     * 2. Residual drain: Clears any leftover bytes on Endpoint IN 0x84.
+     * 3. Start Command: Transmits \x1bX\n scan command to Bulk OUT Endpoint 0x03.
+     * 4. Motor Warmup: Waits 2s for lamp calibration and carriage motor movement.
+     * 5. Raster Reception: Streams data chunks from Bulk IN Endpoint 0x84 until scanner finishes.
+     * 6. Block Dechunking: Unpacks brscan4 [tag, len_lo, len_hi] blocks into clean JPEG/PackBits.
+     * 7. Session Teardown: Sends 0xC0 BREQ_GET_CLOSE.
      */
     suspend fun performScan(
         resolution: ScanResolution = ScanResolution.DPI_300,
@@ -70,11 +70,20 @@ class BrotherScanProtocol(
             Log.d(TAG, "Driver handshake loop result: $handshakeSuccess")
             onProgress(10)
 
-            // Step 2: Negotiate Parameters via \x1bI\n Query Command
-            performParameterNegotiation(resolution, mode)
-            onProgress(18)
+            // Step 2: Clear residual bytes on IN endpoint to ensure a clean channel
+            var drainedTotal = 0
+            val drainBuf = ByteArray(1024)
+            while (true) {
+                val d = connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 50)
+                if (d <= 0) break
+                drainedTotal += d
+            }
+            if (drainedTotal > 0) {
+                Log.d(TAG, "Drained $drainedTotal stale residual bytes before starting scan.")
+            }
+            onProgress(15)
 
-            // Step 3: Build & Transmit Official brscan Start Command
+            // Step 3: Build & Transmit Official brscan Start Command (\x1bX\n)
             val startCmd = buildBrScanStartCommand(resolution, mode)
             Log.d(TAG, "Sending scan start command (${startCmd.size} bytes):\n${String(startCmd, Charsets.US_ASCII)}")
 
@@ -96,44 +105,51 @@ class BrotherScanProtocol(
                 return@withContext ScanResult.Failure(err)
             }
 
-            onProgress(25)
+            onProgress(20)
             // Wait for scanner mechanical carriage motor initialization and lamp calibration
-            delay(1200)
+            // libsane-brother4 uses sleep(3)
+            delay(2000)
 
             // Step 4: Stream Scanned Raster Data from Bulk IN Endpoint
             val rawStream = ByteArrayOutputStream()
             val buffer = ByteArray(BUFFER_SIZE)
-            var scanning = true
             var totalBytesRead = 0
-            var emptyReads = 0
+            var consecutiveTimeouts = 0
+            var scanning = true
 
             while (scanning) {
-                val bytesRead = connection.bulkTransfer(endpointIn, buffer, buffer.size, USB_TIMEOUT_MS)
-                if (bytesRead > 0) {
-                    emptyReads = 0
-                    totalBytesRead += bytesRead
+                // Generous timeout for first packet while carriage starts moving, 5s for subsequent packets
+                val timeoutMs = if (totalBytesRead == 0) 30000 else 5000
+                val bytesRead = connection.bulkTransfer(endpointIn, buffer, buffer.size, timeoutMs)
 
-                    // Scan for in-stream status marker (0x80 = Page End)
-                    for (i in 0 until bytesRead) {
-                        val b = buffer[i]
-                        if (b == UsbConstants.STATUS_PAGE_END) {
-                            Log.d(TAG, "Detected Page End (0x80) marker at byte offset: $totalBytesRead")
-                            scanning = false
-                            break
-                        } else if (b == UsbConstants.STATUS_CANCEL_1 || b == UsbConstants.STATUS_CANCEL_2) {
-                            Log.w(TAG, "Detected cancel status from scanner")
+                if (bytesRead > 0) {
+                    consecutiveTimeouts = 0
+                    totalBytesRead += bytesRead
+                    rawStream.write(buffer, 0, bytesRead)
+
+                    // Update UI progress smoothly (20% to 92%)
+                    val currentProgress = (20 + (totalBytesRead / 40000)).coerceAtMost(92)
+                    onProgress(currentProgress)
+
+                    // Check if device sent terminal marker in a short packet (Page End 0x80..0x86)
+                    if (bytesRead <= 4) {
+                        val firstByte = buffer[0].toInt() and 0xFF
+                        if (firstByte in 0x80..0x86) {
+                            Log.d(TAG, "Detected standalone Page End marker (0x${firstByte.toString(16)}) in short packet ($bytesRead bytes). Scan complete!")
                             scanning = false
                             break
                         }
                     }
-
-                    rawStream.write(buffer, 0, bytesRead)
-                    val currentProgress = (25 + (totalBytesRead / 50000)).coerceAtMost(92)
-                    onProgress(currentProgress)
                 } else {
-                    emptyReads++
-                    Log.d(TAG, "Bulk read returned $bytesRead (empty streak: $emptyReads, total read: $totalBytesRead)")
-                    if (emptyReads > 3 || (totalBytesRead > 0 && bytesRead <= 0)) {
+                    consecutiveTimeouts++
+                    Log.d(TAG, "Bulk read returned $bytesRead (timeouts: $consecutiveTimeouts, total read: $totalBytesRead)")
+                    // Once data has been transferred and device goes silent, the page is done
+                    if (totalBytesRead > 0 && consecutiveTimeouts >= 2) {
+                        Log.d(TAG, "Scanner finished transmission ($totalBytesRead total bytes received).")
+                        scanning = false
+                    } else if (totalBytesRead == 0 && consecutiveTimeouts >= 2) {
+                        val err = "Timed out waiting for scanner carriage to return data."
+                        Log.e(TAG, err)
                         scanning = false
                     }
                 }
@@ -141,7 +157,7 @@ class BrotherScanProtocol(
 
             onProgress(95)
             val rawBytes = rawStream.toByteArray()
-            Log.d(TAG, "Total raw scan bytes received: ${rawBytes.size}")
+            Log.d(TAG, "Total raw scan bytes received from hardware: ${rawBytes.size}")
 
             // Step 5: Send close teardown
             tryCloseHandshake()
@@ -224,27 +240,6 @@ class BrotherScanProtocol(
         return false
     }
 
-    /**
-     * Executes QueryScanInfo (\x1bI\n) negotiation matching libsane-brother4 QueryScanInfoProc.
-     */
-    private fun performParameterNegotiation(resolution: ScanResolution, mode: ScanColorMode) {
-        try {
-            val dpi = resolution.dpi
-            val queryCmd = "\u001BI\nR=$dpi,$dpi\nM=${mode.code}\n\u0080".toByteArray(Charsets.US_ASCII)
-            val written = connection.bulkTransfer(endpointOut, queryCmd, queryCmd.size, 2000)
-            Log.d(TAG, "Parameter negotiation query (\u001BI) written: $written bytes")
-
-            val responseBuf = ByteArray(512)
-            val bytesRead = connection.bulkTransfer(endpointIn, responseBuf, responseBuf.size, 1500)
-            if (bytesRead > 0) {
-                val responseStr = String(responseBuf, 0, bytesRead, Charsets.US_ASCII)
-                Log.d(TAG, "Parameter negotiation response ($bytesRead bytes): $responseStr")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Parameter negotiation error (non-fatal): ${e.message}")
-        }
-    }
-
     private fun clearEndpointHalt(endpointAddress: Int) {
         try {
             connection.controlTransfer(0x02, 0x01, 0x00, endpointAddress, null, 0, 1000)
@@ -309,37 +304,123 @@ class BrotherScanProtocol(
         return fullCmd
     }
 
+    /**
+     * Unpacks Brother brscan4 stream blocks disassembled from libsane-brother4 make_cache_block.
+     * Each block on Endpoint 0x84: [tag: 1 byte] [len_lo: 1 byte] [len_hi: 1 byte] [payload: len bytes]
+     * For model type 1 (DCP-B7500D), tag is 0x64 ('d') for data chunks.
+     * End of stream is signaled by tag in 0x80..0x86.
+     */
+    private fun dechunkBrotherBlocks(rawBytes: ByteArray): ByteArray {
+        val n = rawBytes.size
+        if (n < 4) return rawBytes
+
+        // If the stream is already pure unchunked JPEG (starts with 0xFF 0xD8)
+        if (rawBytes[0] == 0xFF.toByte() && rawBytes[1] == 0xD8.toByte()) {
+            Log.d(TAG, "Stream begins directly with JPEG SOI marker (no block headers)")
+            return rawBytes
+        }
+
+        val out = ByteArrayOutputStream()
+        var i = 0
+        var blockCount = 0
+
+        while (i < n) {
+            val tag = rawBytes[i].toInt() and 0xFF
+
+            // Terminal markers in Brother SANE driver
+            if (tag in 0x80..0x86) {
+                Log.d(TAG, "Brother stream terminator tag 0x${tag.toString(16)} encountered at offset $i (extracted $blockCount blocks)")
+                break
+            }
+
+            // Need at least 3 bytes for [tag, len_lo, len_hi]
+            if (i + 3 > n) {
+                val remaining = n - i
+                Log.w(TAG, "Incomplete block header at offset $i (remaining $remaining bytes)")
+                break
+            }
+
+            val lenLo = rawBytes[i + 1].toInt() and 0xFF
+            val lenHi = rawBytes[i + 2].toInt() and 0xFF
+            val chunkLen = lenLo or (lenHi shl 8)
+
+            val payloadStart = i + 3
+            val payloadEnd = (payloadStart + chunkLen).coerceAtMost(n)
+
+            if (payloadEnd > payloadStart) {
+                out.write(rawBytes, payloadStart, payloadEnd - payloadStart)
+            }
+
+            blockCount++
+            i += 3 + chunkLen
+        }
+
+        val payload = out.toByteArray()
+        Log.d(TAG, "Brother block dechunking: raw=$n bytes, blocks=$blockCount -> payload=${payload.size} bytes")
+        return if (payload.isNotEmpty()) payload else rawBytes
+    }
+
     private fun decodeColorJpegStream(data: ByteArray): Bitmap? {
+        val payload = dechunkBrotherBlocks(data)
+
+        // Find JPEG SOI marker 0xFF 0xD8
         var startIndex = -1
-        for (i in 0 until data.size - 1) {
-            if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) {
+        for (i in 0 until payload.size - 1) {
+            if (payload[i] == 0xFF.toByte() && payload[i + 1] == 0xD8.toByte()) {
                 startIndex = i
                 break
             }
         }
 
         val offset = if (startIndex >= 0) startIndex else 0
-        return BitmapFactory.decodeByteArray(data, offset, data.size - offset)
+        val length = payload.size - offset
+        Log.d(TAG, "Decoding JPEG: total bytes=${payload.size}, SOI offset=$offset, length=$length")
+
+        val bitmap = BitmapFactory.decodeByteArray(payload, offset, length)
+        if (bitmap == null) {
+            // Also try decoding the raw unmodified bytes in case framing differed
+            Log.w(TAG, "Dechunked JPEG decode returned null, trying raw bytes fallback...")
+            var rawSoi = -1
+            for (i in 0 until data.size - 1) {
+                if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) {
+                    rawSoi = i
+                    break
+                }
+            }
+            if (rawSoi >= 0) {
+                return BitmapFactory.decodeByteArray(data, rawSoi, data.size - rawSoi)
+            }
+        }
+        return bitmap
     }
 
     private fun decodeMonoPackBitsStream(data: ByteArray, resolution: ScanResolution): Bitmap? {
-        val decompressed = PackBitsDecoder.decompress(data)
-        if (decompressed.isEmpty()) return null
+        val payload = dechunkBrotherBlocks(data)
+        val decompressed = PackBitsDecoder.decompress(payload)
+        if (decompressed.isEmpty()) {
+            Log.e(TAG, "PackBits decompression yielded 0 bytes from ${payload.size} payload bytes")
+            return null
+        }
 
         val width = (8.27f * resolution.dpi).toInt()
-        val height = ((decompressed.size * 8) / width).coerceAtLeast(1)
+        val rowBytes = (width + 7) / 8
+        val height = if (rowBytes > 0) (decompressed.size / rowBytes).coerceAtLeast(1) else 1
+
+        Log.d(TAG, "Decoding Mono PackBits: width=$width, height=$height, rowBytes=$rowBytes, decompressed=${decompressed.size} bytes")
 
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(width * height)
 
-        var pixelIdx = 0
-        for (byte in decompressed) {
-            val unsignedByte = byte.toInt() and 0xFF
-            for (bit in 7 downTo 0) {
-                if (pixelIdx >= pixels.size) break
-                val isBlack = ((unsignedByte shr bit) and 1) == 0
-                pixels[pixelIdx++] = if (isBlack) -0x1000000 else -0x1
+        var byteOffset = 0
+        for (y in 0 until height) {
+            if (byteOffset + rowBytes > decompressed.size) break
+            for (x in 0 until width) {
+                val byteVal = decompressed[byteOffset + (x / 8)].toInt() and 0xFF
+                val bitVal = (byteVal shr (7 - (x % 8))) and 1
+                // Brother SANE monochrome: 0 = black (ink), 1 = white (paper)
+                pixels[y * width + x] = if (bitVal == 0) -0x1000000 else -0x1
             }
+            byteOffset += rowBytes
         }
 
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
@@ -347,15 +428,18 @@ class BrotherScanProtocol(
     }
 
     private fun decodeGrayscaleStream(data: ByteArray, resolution: ScanResolution): Bitmap? {
+        val payload = dechunkBrotherBlocks(data)
         val width = (8.27f * resolution.dpi).toInt()
-        val height = (data.size / width).coerceAtLeast(1)
+        val height = (payload.size / width).coerceAtLeast(1)
+
+        Log.d(TAG, "Decoding Grayscale: width=$width, height=$height, payload=${payload.size} bytes")
 
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(width * height)
 
-        val limit = (width * height).coerceAtMost(data.size)
+        val limit = (width * height).coerceAtMost(payload.size)
         for (i in 0 until limit) {
-            val gray = data[i].toInt() and 0xFF
+            val gray = payload[i].toInt() and 0xFF
             pixels[i] = (0xFF shl 24) or (gray shl 16) or (gray shl 8) or gray
         }
 
