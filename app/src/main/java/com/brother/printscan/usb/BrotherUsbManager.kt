@@ -171,17 +171,6 @@ class BrotherUsbManager(private val context: Context) {
             scanInterface = null
             printInterface = null
 
-            // Explicitly set configuration 1 as required by Brother driver (libsane-brother4)
-            try {
-                if (device.configurationCount > 0) {
-                    val config = device.getConfiguration(0)
-                    val setConfigResult = connection.setConfiguration(config)
-                    Log.d(TAG, "connection.setConfiguration(config 0): $setConfigResult")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "setConfiguration warning: ${e.message}")
-            }
-
             val epSummary = StringBuilder()
 
             // Forensic discovery from libsane-brother4.so.1.0.7 / ext_20.ini:
@@ -218,11 +207,6 @@ class BrotherUsbManager(private val context: Context) {
                 }
                 epSummary.append(" | ")
             }
-
-            // Clear halt on scanner OUT and IN endpoints
-            scanEndpointOut?.let { clearHalt(it.address) }
-            scanEndpointIn?.let { clearHalt(it.address) }
-            printEndpointOut?.let { clearHalt(it.address) }
 
             val canScan = scanEndpointIn != null && scanEndpointOut != null
             val canPrint = printEndpointOut != null

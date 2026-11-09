@@ -163,11 +163,11 @@ class BrotherScanProtocol(
     /**
      * Executes the exact OpenDevice handshake loop disassembled from libsane-brother4.so:
      * Loop up to 5 times:
-     *   controlTransfer(0xC0, 0x01, 0x02, 0, buf, 5, 2000)
-     *   Check header: buf[0] == 5, buf[1] == 0x10, buf[2] == 1, buf[3..4] != 2
+     *   controlTransfer(0xC0 or 0xC1, 0x01, 0x02, 0 or 1, buf, 5, 2000)
+     *   Check header: buf[0] == 5, buf[1] == 0x10, buf[2] == 1, buf[3..4] == 2
      *   If not matching:
      *     controlTransfer(0xC0, 0x02, 0x02, 0, buf, 5, 2000)
-     *     usleep(500000)
+     *     delay(500)
      *     Send Q-Command '\x1bQ\n\x80' to Bulk OUT
      *     Read response from Bulk IN
      */
@@ -176,7 +176,12 @@ class BrotherScanProtocol(
         val qCmd = byteArrayOf(0x1B, 0x51, 0x0A, 0x80.toByte()) // \x1bQ\n\x80
 
         for (retry in 0..4) {
-            val rc = connection.controlTransfer(0xC0, 0x01, 0x02, 0, openBuf, openBuf.size, 2000)
+            // First try 0xC0 (Device recipient, index 0)
+            var rc = connection.controlTransfer(0xC0, 0x01, 0x02, 0, openBuf, openBuf.size, 2000)
+            if (rc < 0) {
+                // Try 0xC1 (Interface recipient, index 1)
+                rc = connection.controlTransfer(0xC1, 0x01, 0x02, 1, openBuf, openBuf.size, 2000)
+            }
             Log.d(TAG, "Handshake retry $retry: BREQ_GET_OPEN rc=$rc, data=${openBuf.joinToString { "0x%02x".format(it) }}")
 
             if (rc >= 0 && openBuf.size >= 5) {
@@ -193,12 +198,12 @@ class BrotherScanProtocol(
 
             // Recovery branch: Send BREQ_GET_CLOSE and Q-command
             connection.controlTransfer(0xC0, 0x02, 0x02, 0, openBuf, openBuf.size, 2000)
-            delay(500)
+            delay(300)
 
             // Send Q-command to bulk OUT and drain response from bulk IN
             connection.bulkTransfer(endpointOut, qCmd, qCmd.size, 2000)
             val drainBuf = ByteArray(512)
-            connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 2000)
+            connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 1000)
             delay(100)
         }
 

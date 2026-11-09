@@ -66,18 +66,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // Claim Interface 1 (Scanner) exclusively before initiating bulk transfers
-        val claimed = usbManager.claimScannerInterface()
-        if (!claimed) {
-            _statusMessage.value = "Failed to claim scanner USB interface. Re-plug OTG cable."
-            return
-        }
-
         viewModelScope.launch {
             try {
                 _isBusy.value = true
                 _statusMessage.value = "Scanning flatbed at ${resolution.dpi} DPI..."
                 _operationProgress.value = 0
+
+                // Claim Interface 1 (Scanner) exclusively inside IO coroutine
+                val claimed = usbManager.claimScannerInterface()
+                if (!claimed) {
+                    _statusMessage.value = "Failed to claim scanner USB interface. Re-plug OTG cable."
+                    return@launch
+                }
 
                 val protocol = BrotherScanProtocol(conn, inEp, outEp)
                 val bitmap = protocol.performScan(resolution, mode) { progress ->
@@ -185,17 +185,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val claimed = usbManager.claimPrinterInterface()
-        if (!claimed) {
-            _statusMessage.value = "Failed to claim printer USB interface"
-            return
-        }
-
         viewModelScope.launch {
             try {
                 _isBusy.value = true
                 _statusMessage.value = "Sending print job to Brother printer..."
                 _operationProgress.value = 0
+
+                val claimed = usbManager.claimPrinterInterface()
+                if (!claimed) {
+                    _statusMessage.value = "Failed to claim printer USB interface"
+                    return@launch
+                }
 
                 val printProtocol = BrotherPrintProtocol(conn, outEp)
                 val success = printProtocol.printBitmap(bitmap, copies) { progress ->
@@ -204,6 +204,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
                 _statusMessage.value = if (success) "Print job completed!" else "Print failed"
             } finally {
+                usbManager.claimScannerInterface() // restore scanner state
                 _isBusy.value = false
             }
         }
