@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Brother Print &amp; Scan Pro</string>
+    <string name="scanner_title">USB Document Scanner</string>
+    <string name="printer_title">USB Document Printer</string>
+    <string name="studio_title">Pro Document Studio</string>
+</resources>
