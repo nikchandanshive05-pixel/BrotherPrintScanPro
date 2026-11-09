@@ -44,6 +44,12 @@ class BrotherScanProtocol(
 
     /**
      * Executes scan session with hardware handshaking, command transmission, and stream reception.
+     * Follows the exact SANE brother4 sequence reverse-engineered from libsane-brother4.so.1.0.7:
+     * 1. Handshake Loop: 0xC0 BREQ_GET_OPEN with recovery 0xC0 BREQ_GET_CLOSE + Q-Command proc.
+     * 2. Parameter Negotiation: Sends \x1bI\n query command and reads scanner response.
+     * 3. Start Command: Transmits \x1bX\n scan command to Endpoint 0x03.
+     * 4. Raster Reception: Streams data from Bulk IN Endpoint 0x84 until 0x80 Page End marker.
+     * 5. Session Teardown: Sends 0xC0 BREQ_GET_CLOSE.
      */
     suspend fun performScan(
         resolution: ScanResolution = ScanResolution.DPI_300,
@@ -51,14 +57,19 @@ class BrotherScanProtocol(
         onProgress: (Int) -> Unit = {}
     ): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Initiating Brother Scan on EP IN 0x${endpointIn.address.toString(16)}, OUT 0x${endpointOut.address.toString(16)}")
+            Log.d(TAG, "Initiating Brother Scan: ${resolution.dpi} DPI, Mode: $mode on OUT 0x${endpointOut.address.toString(16)}, IN 0x${endpointIn.address.toString(16)}")
             onProgress(5)
 
-            // Step 1: Try Vendor Control Handshake
-            tryControlHandshake()
-            onProgress(12)
+            // Step 1: Execute Brother Driver Handshake Loop
+            val handshakeSuccess = performDriverHandshakeLoop()
+            Log.d(TAG, "Driver handshake loop result: $handshakeSuccess")
+            onProgress(10)
 
-            // Step 2: Build & Transmit Official brscan Start Command
+            // Step 2: Negotiate Parameters via \x1bI\n Query Command
+            performParameterNegotiation(resolution, mode)
+            onProgress(18)
+
+            // Step 3: Build & Transmit Official brscan Start Command
             val startCmd = buildBrScanStartCommand(resolution, mode)
             Log.d(TAG, "Sending scan start command (${startCmd.size} bytes):\n${String(startCmd, Charsets.US_ASCII)}")
 
@@ -66,22 +77,23 @@ class BrotherScanProtocol(
             Log.d(TAG, "Bytes written to bulk OUT endpoint 0x${endpointOut.address.toString(16)}: $bytesWritten")
 
             if (bytesWritten < 0) {
-                // Retry once after 500ms delay
-                delay(500)
+                // Retry once after 300ms delay
+                delay(300)
                 bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
                 Log.d(TAG, "Retry write returned: $bytesWritten")
             }
 
             if (bytesWritten < 0) {
                 Log.e(TAG, "Failed to write scan command to bulk OUT endpoint")
+                tryCloseHandshake()
                 return@withContext null
             }
 
-            onProgress(20)
-            // Wait for scanner motor calibration
-            delay(1200)
+            onProgress(25)
+            // Wait 1.5s for scanner mechanical motor initialization and lamp calibration
+            delay(1500)
 
-            // Step 3: Stream Scanned Raster Data from Bulk IN Endpoint
+            // Step 4: Stream Scanned Raster Data from Bulk IN Endpoint
             val rawStream = ByteArrayOutputStream()
             val buffer = ByteArray(BUFFER_SIZE)
             var scanning = true
@@ -98,7 +110,7 @@ class BrotherScanProtocol(
                     for (i in 0 until bytesRead) {
                         val b = buffer[i]
                         if (b == UsbConstants.STATUS_PAGE_END) {
-                            Log.d(TAG, "Detected Page End (0x80) marker at offset: $totalBytesRead")
+                            Log.d(TAG, "Detected Page End (0x80) marker at byte offset: $totalBytesRead")
                             scanning = false
                             break
                         } else if (b == UsbConstants.STATUS_CANCEL_1 || b == UsbConstants.STATUS_CANCEL_2) {
@@ -109,7 +121,7 @@ class BrotherScanProtocol(
                     }
 
                     rawStream.write(buffer, 0, bytesRead)
-                    val currentProgress = (20 + (totalBytesRead / 50000)).coerceAtMost(92)
+                    val currentProgress = (25 + (totalBytesRead / 50000)).coerceAtMost(92)
                     onProgress(currentProgress)
                 } else {
                     emptyReads++
@@ -124,7 +136,7 @@ class BrotherScanProtocol(
             val rawBytes = rawStream.toByteArray()
             Log.d(TAG, "Total raw scan bytes received: ${rawBytes.size}")
 
-            // Send close teardown
+            // Step 5: Send close teardown
             tryCloseHandshake()
 
             if (rawBytes.isEmpty()) {
@@ -132,7 +144,7 @@ class BrotherScanProtocol(
                 return@withContext null
             }
 
-            // Step 4: Decode Raw Payload
+            // Step 6: Decode Raw Payload
             val bitmap = when (mode) {
                 ScanColorMode.TRUE_COLOR_JPEG -> decodeColorJpegStream(rawBytes)
                 ScanColorMode.MONOCHROME_PACKBITS -> decodeMonoPackBitsStream(rawBytes, resolution)
@@ -149,16 +161,68 @@ class BrotherScanProtocol(
     }
 
     /**
-     * Tries control handshake with fallback request types (0xC0 and 0xC1 for interface recipient).
+     * Executes the exact OpenDevice handshake loop disassembled from libsane-brother4.so:
+     * Loop up to 5 times:
+     *   controlTransfer(0xC0, 0x01, 0x02, 0, buf, 5, 2000)
+     *   Check header: buf[0] == 5, buf[1] == 0x10, buf[2] == 1, buf[3..4] != 2
+     *   If not matching:
+     *     controlTransfer(0xC0, 0x02, 0x02, 0, buf, 5, 2000)
+     *     usleep(500000)
+     *     Send Q-Command '\x1bQ\n\x80' to Bulk OUT
+     *     Read response from Bulk IN
      */
-    private fun tryControlHandshake() {
-        val data = ByteArray(5)
-        // Try recipient = Device (0xC0) with index = 0 and index = 1
-        var rc = connection.controlTransfer(0xC0, 0x01, 0x02, 0, data, data.size, 1000)
-        Log.d(TAG, "controlTransfer (0xC0, idx 0): rc=$rc")
-        if (rc < 0) {
-            rc = connection.controlTransfer(0xC1, 0x01, 0x02, 1, data, data.size, 1000)
-            Log.d(TAG, "controlTransfer (0xC1, idx 1): rc=$rc")
+    private suspend fun performDriverHandshakeLoop(): Boolean {
+        val openBuf = ByteArray(5)
+        val qCmd = byteArrayOf(0x1B, 0x51, 0x0A, 0x80.toByte()) // \x1bQ\n\x80
+
+        for (retry in 0..4) {
+            val rc = connection.controlTransfer(0xC0, 0x01, 0x02, 0, openBuf, openBuf.size, 2000)
+            Log.d(TAG, "Handshake retry $retry: BREQ_GET_OPEN rc=$rc, data=${openBuf.joinToString { "0x%02x".format(it) }}")
+
+            if (rc >= 0 && openBuf.size >= 5) {
+                val b0 = openBuf[0].toInt() and 0xFF
+                val b1 = openBuf[1].toInt() and 0xFF
+                val b2 = openBuf[2].toInt() and 0xFF
+                val wVal = (openBuf[3].toInt() and 0xFF) or ((openBuf[4].toInt() and 0xFF) shl 8)
+
+                if (b0 == 5 && b1 == 0x10 && b2 == 1 && wVal == 2) {
+                    Log.d(TAG, "Handshake successful! Scanner ready.")
+                    return true
+                }
+            }
+
+            // Recovery branch: Send BREQ_GET_CLOSE and Q-command
+            connection.controlTransfer(0xC0, 0x02, 0x02, 0, openBuf, openBuf.size, 2000)
+            delay(500)
+
+            // Send Q-command to bulk OUT and drain response from bulk IN
+            connection.bulkTransfer(endpointOut, qCmd, qCmd.size, 2000)
+            val drainBuf = ByteArray(512)
+            connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 2000)
+            delay(100)
+        }
+
+        return false
+    }
+
+    /**
+     * Executes QueryScanInfo (\x1bI\n) negotiation matching libsane-brother4 QueryScanInfoProc.
+     */
+    private fun performParameterNegotiation(resolution: ScanResolution, mode: ScanColorMode) {
+        try {
+            val dpi = resolution.dpi
+            val queryCmd = "\u001BI\nR=$dpi,$dpi\nM=${mode.code}\n\u0080".toByteArray(Charsets.US_ASCII)
+            val written = connection.bulkTransfer(endpointOut, queryCmd, queryCmd.size, 2000)
+            Log.d(TAG, "Parameter negotiation query (\u001BI) written: $written bytes")
+
+            val responseBuf = ByteArray(512)
+            val bytesRead = connection.bulkTransfer(endpointIn, responseBuf, responseBuf.size, 2000)
+            if (bytesRead > 0) {
+                val responseStr = String(responseBuf, 0, bytesRead, Charsets.US_ASCII)
+                Log.d(TAG, "Parameter negotiation response ($bytesRead bytes): $responseStr")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Parameter negotiation error (non-fatal): ${e.message}")
         }
     }
 
@@ -199,8 +263,6 @@ class BrotherScanProtocol(
         sb.append("C=$compression\n")
         sb.append("B=50\n")
         sb.append("N=50\n")
-        sb.append("U=OFF\n")
-        sb.append("P=OFF\n")
         sb.append("A=0,0,$dotsX,$dotsY\n")
 
         val asciiBytes = sb.toString().toByteArray(Charsets.US_ASCII)

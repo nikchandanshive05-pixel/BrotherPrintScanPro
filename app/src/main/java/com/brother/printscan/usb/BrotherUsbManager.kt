@@ -171,15 +171,26 @@ class BrotherUsbManager(private val context: Context) {
             scanInterface = null
             printInterface = null
 
+            // Explicitly set configuration 1 as required by Brother driver (libsane-brother4)
+            try {
+                if (device.configurationCount > 0) {
+                    val config = device.getConfiguration(0)
+                    val setConfigResult = connection.setConfiguration(config)
+                    Log.d(TAG, "connection.setConfiguration(config 0): $setConfigResult")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "setConfiguration warning: ${e.message}")
+            }
+
             val epSummary = StringBuilder()
 
-            // Forensic discovery from ext_20.ini:
+            // Forensic discovery from libsane-brother4.so.1.0.7 / ext_20.ini:
             // DCP-B7500D (PID 0x041b):
             // Interface 0: Printer (0x01 Bulk OUT, 0x82 Bulk IN)
             // Interface 1: Scanner (0x03 Bulk OUT, 0x84 Bulk IN)
             for (i in 0 until device.interfaceCount) {
                 val iface = device.getInterface(i)
-                epSummary.append("IF $i (${iface.interfaceClass}): ")
+                epSummary.append("IF $i (Class ${iface.interfaceClass}): ")
 
                 if (iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER || i == 0) {
                     printInterface = iface
@@ -208,6 +219,11 @@ class BrotherUsbManager(private val context: Context) {
                 epSummary.append(" | ")
             }
 
+            // Clear halt on scanner OUT and IN endpoints
+            scanEndpointOut?.let { clearHalt(it.address) }
+            scanEndpointIn?.let { clearHalt(it.address) }
+            printEndpointOut?.let { clearHalt(it.address) }
+
             val canScan = scanEndpointIn != null && scanEndpointOut != null
             val canPrint = printEndpointOut != null
             val modelName = device.productName ?: "Brother DCP-B7500D (0x${device.productId.toString(16)})"
@@ -227,6 +243,29 @@ class BrotherUsbManager(private val context: Context) {
             _connectionState.value = UsbConnectionState(
                 errorMessage = "Init error: ${e.message}"
             )
+        }
+    }
+
+    /**
+     * Standard USB CLEAR_FEATURE ENDPOINT_HALT request matching libusb_clear_halt().
+     */
+    fun clearHalt(endpointAddress: Int): Boolean {
+        val conn = activeConnection ?: return false
+        return try {
+            val rc = conn.controlTransfer(
+                0x02, // USB_RECIP_ENDPOINT | USB_TYPE_STANDARD | USB_DIR_OUT
+                0x01, // USB_REQ_CLEAR_FEATURE
+                0x00, // ENDPOINT_HALT
+                endpointAddress,
+                null,
+                0,
+                1000
+            )
+            Log.d(TAG, "clearHalt(0x${endpointAddress.toString(16)}): rc=$rc")
+            rc >= 0
+        } catch (e: Exception) {
+            Log.w(TAG, "clearHalt error: ${e.message}")
+            false
         }
     }
 
