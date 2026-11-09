@@ -81,7 +81,7 @@ fun HomeScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = connectionState.deviceName,
                             style = MaterialTheme.typography.bodyLarge,
@@ -98,6 +98,14 @@ fun HomeScreen(
                         imageVector = if (connectionState.isConnected) Icons.Default.CheckCircle else Icons.Default.Warning,
                         contentDescription = "Status",
                         tint = if (connectionState.isConnected) OliveAccent else TerracottaCallout
+                    )
+                }
+
+                if (connectionState.endpointDetails.isNotEmpty()) {
+                    Text(
+                        text = "Endpoints: ${connectionState.endpointDetails}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.DarkGray
                     )
                 }
 

@@ -7,18 +7,17 @@ import android.hardware.usb.UsbEndpoint
 import android.util.Log
 import com.brother.printscan.usb.UsbConstants
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
- * Scan mode configurations.
+ * Scan mode configurations matching Brother SANE protocol specifications.
  */
-enum class ScanColorMode(val code: Int) {
-    MONOCHROME_PACKBITS(1),
-    GRAYSCALE(2),
-    TRUE_COLOR_JPEG(4)
+enum class ScanColorMode(val code: String) {
+    MONOCHROME_PACKBITS("TEXT"),
+    GRAYSCALE("GRAY256"),
+    TRUE_COLOR_JPEG("CGRAY")
 }
 
 enum class ScanResolution(val dpi: Int) {
@@ -29,8 +28,8 @@ enum class ScanResolution(val dpi: Int) {
 }
 
 /**
- * Direct implementation of the Brother scanner protocol.
- * Handles handshaking, configuration commands, and streaming packet assembly.
+ * Native Brother Hardware Protocol Implementation.
+ * Uses official SANE brscan command structures and USB control messages.
  */
 class BrotherScanProtocol(
     private val connection: UsbDeviceConnection,
@@ -39,15 +38,19 @@ class BrotherScanProtocol(
 ) {
     companion object {
         private const val TAG = "BrotherScanProtocol"
-        private const val USB_TIMEOUT_MS = 10000
-        private const val BUFFER_SIZE = 16384
+        private const val USB_TIMEOUT_MS = 15000
+        private const val BUFFER_SIZE = 32768
+
+        // Brother Control Message Request Types
+        private const val BREQ_TYPE = 0xC0
+        private const val BREQ_GET_OPEN = 0x01
+        private const val BREQ_GET_CLOSE = 0x02
+        private const val BCOMMAND_SCANNER = 0x02
+        private const val BREQ_GET_LENGTH = 5
     }
 
     /**
-     * Executes a complete scan operation and returns the decoded Android Bitmap.
-     * @param resolution Target resolution (100, 200, 300, 600 DPI)
-     * @param mode Monochrome (PackBits), Grayscale, or Color (JPEG stream)
-     * @param onProgress Callback with progress percentage (0..100)
+     * Executes scan session with hardware handshaking, command transmission, and stream reception.
      */
     suspend fun performScan(
         resolution: ScanResolution = ScanResolution.DPI_300,
@@ -55,97 +58,183 @@ class BrotherScanProtocol(
         onProgress: (Int) -> Unit = {}
     ): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Starting scan session: ${resolution.dpi} DPI, Mode: $mode")
+            Log.d(TAG, "Initiating Brother Scan: ${resolution.dpi} DPI, Mode: ${mode.name}")
             onProgress(5)
 
-            // Step 1: Send Initialization & Parameter Commands
-            val initCmd = buildInitCommand(resolution, mode)
-            val bytesSent = connection.bulkTransfer(endpointOut, initCmd, initCmd.size, USB_TIMEOUT_MS)
-            if (bytesSent < 0) {
-                Log.e(TAG, "Failed to send initialization command to scanner")
+            // Step 1: Brother USB Hardware Handshake (GET_OPEN control message)
+            val openSuccess = sendGetOpenControlMessage()
+            Log.d(TAG, "GET_OPEN control message result: $openSuccess")
+            onProgress(10)
+
+            // Step 2: Build & Transmit Official brscan Start Command
+            val startCmd = buildBrScanStartCommand(resolution, mode)
+            Log.d(TAG, "Sending scan start command (${startCmd.size} bytes):\n${String(startCmd, Charsets.US_ASCII)}")
+
+            val bytesWritten = connection.bulkTransfer(endpointOut, startCmd, startCmd.size, 5000)
+            Log.d(TAG, "Bytes written to scanner endpoint (0x${endpointOut.address.toString(16)}): $bytesWritten")
+
+            if (bytesWritten < 0) {
+                Log.e(TAG, "Failed to write scan command to bulk OUT endpoint")
+                sendGetCloseControlMessage()
                 return@withContext null
             }
-            onProgress(15)
 
-            // Step 2: Read Scanned Data Stream
+            onProgress(20)
+            // Allow mechanical scanner carriage calibration time
+            delay(1000)
+
+            // Step 3: Stream Scanned Raster Data from Bulk IN Endpoint
             val rawStream = ByteArrayOutputStream()
             val buffer = ByteArray(BUFFER_SIZE)
             var scanning = true
-            var bytesReadTotal = 0
+            var totalBytesRead = 0
+            var emptyReads = 0
 
             while (scanning) {
                 val bytesRead = connection.bulkTransfer(endpointIn, buffer, buffer.size, USB_TIMEOUT_MS)
                 if (bytesRead > 0) {
-                    bytesReadTotal += bytesRead
+                    emptyReads = 0
+                    totalBytesRead += bytesRead
 
-                    // Inspect in-stream status codes
+                    // Scan for in-stream status marker (0x80 = Page End)
                     for (i in 0 until bytesRead) {
                         val b = buffer[i]
                         if (b == UsbConstants.STATUS_PAGE_END) {
-                            Log.d(TAG, "Received Page End status marker (0x80)")
+                            Log.d(TAG, "Detected Page End (0x80) marker in stream at byte offset: $totalBytesRead")
                             scanning = false
                             break
                         } else if (b == UsbConstants.STATUS_CANCEL_1 || b == UsbConstants.STATUS_CANCEL_2) {
-                            Log.w(TAG, "Received Cancel marker from scanner")
+                            Log.w(TAG, "Detected cancel status from scanner")
                             scanning = false
                             break
                         }
                     }
 
                     rawStream.write(buffer, 0, bytesRead)
-                    // Estimate progress up to 90%
-                    val currentProgress = (15 + (bytesReadTotal / 40000)).coerceAtMost(90)
+                    val currentProgress = (20 + (totalBytesRead / 50000)).coerceAtMost(92)
                     onProgress(currentProgress)
                 } else {
-                    // Timeout or end of transfer
-                    Log.d(TAG, "Bulk transfer ended with code: $bytesRead")
-                    scanning = false
+                    emptyReads++
+                    Log.d(TAG, "Bulk read returned $bytesRead (empty streak: $emptyReads)")
+                    if (emptyReads > 3 || totalBytesRead > 0) {
+                        scanning = false
+                    }
                 }
             }
 
-            onProgress(92)
+            onProgress(95)
             val rawBytes = rawStream.toByteArray()
-            Log.d(TAG, "Total raw bytes received: ${rawBytes.size}")
+            Log.d(TAG, "Total raw scan bytes received: ${rawBytes.size}")
 
-            // Step 3: Decode Scan Frame into Bitmap
+            // Step 4: Issue Hardware Session Teardown
+            sendGetCloseControlMessage()
+
+            if (rawBytes.isEmpty()) {
+                Log.e(TAG, "Zero bytes received from scanner.")
+                return@withContext null
+            }
+
+            // Step 5: Decode Raw Payload
             val bitmap = when (mode) {
-                ScanColorMode.TRUE_COLOR_JPEG -> decodeColorStream(rawBytes)
+                ScanColorMode.TRUE_COLOR_JPEG -> decodeColorJpegStream(rawBytes)
                 ScanColorMode.MONOCHROME_PACKBITS -> decodeMonoPackBitsStream(rawBytes, resolution)
                 ScanColorMode.GRAYSCALE -> decodeGrayscaleStream(rawBytes, resolution)
             }
 
-            // Step 4: Issue clean session teardown
-            sendCloseCommand()
             onProgress(100)
-
             bitmap
         } catch (e: Exception) {
-            Log.e(TAG, "Error during scan execution", e)
-            sendCloseCommand()
+            Log.e(TAG, "Exception during scan operation", e)
+            sendGetCloseControlMessage()
             null
         }
     }
 
-    private fun buildInitCommand(resolution: ScanResolution, mode: ScanColorMode): ByteArray {
-        val out = ByteArrayOutputStream()
-        // Standard ESC/S Brother scanner initiation preamble
-        out.write(byteArrayOf(0x1B, 0x73, 0x00)) // ESC s NUL
-        out.write("R=${resolution.dpi},M=${mode.code}\r\n".toByteArray(Charsets.US_ASCII))
-        return out.toByteArray()
-    }
-
-    private fun sendCloseCommand() {
-        try {
-            // Brother BREQ_GET_CLOSE command sequence
-            val closeCmd = byteArrayOf(0x1B, 0x00, 0x00, 0x00)
-            connection.bulkTransfer(endpointOut, closeCmd, closeCmd.size, 1000)
+    /**
+     * Issues BREQ_GET_OPEN (0x01) control transfer to initialize Brother scanner session.
+     */
+    private fun sendGetOpenControlMessage(): Boolean {
+        return try {
+            val data = ByteArray(BREQ_GET_LENGTH)
+            val rc = connection.controlTransfer(
+                BREQ_TYPE,
+                BREQ_GET_OPEN,
+                BCOMMAND_SCANNER,
+                0,
+                data,
+                data.size,
+                3000
+            )
+            Log.d(TAG, "controlTransfer BREQ_GET_OPEN: rc=$rc, data=${data.joinToString { String.format("0x%02X", it) }}")
+            rc >= 0
         } catch (e: Exception) {
-            Log.w(TAG, "Teardown command error: ${e.message}")
+            Log.w(TAG, "BREQ_GET_OPEN error: ${e.message}")
+            false
         }
     }
 
-    private fun decodeColorStream(data: ByteArray): Bitmap? {
-        // Find JPEG SOI marker (0xFF, 0xD8)
+    /**
+     * Issues BREQ_GET_CLOSE (0x02) control transfer to cleanly terminate Brother scanner session.
+     */
+    private fun sendGetCloseControlMessage() {
+        try {
+            val data = ByteArray(BREQ_GET_LENGTH)
+            connection.controlTransfer(
+                BREQ_TYPE,
+                BREQ_GET_CLOSE,
+                BCOMMAND_SCANNER,
+                0,
+                data,
+                data.size,
+                2000
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "BREQ_GET_CLOSE error: ${e.message}")
+        }
+    }
+
+    /**
+     * Builds official Brother wire start command:
+     * \x1bX\n
+     * R=300,300\n
+     * M=TEXT\n (or CGRAY / GRAY256)
+     * C=RLENGTH\n (PackBits compression)
+     * B=50\n
+     * N=50\n
+     * U=OFF\n
+     * P=OFF\n
+     * A=0,0,2481,3507\n
+     * \x80
+     */
+    private fun buildBrScanStartCommand(resolution: ScanResolution, mode: ScanColorMode): ByteArray {
+        val dpi = resolution.dpi
+        // A4 page boundaries in scan dots: 8.27 in x 11.69 in
+        val dotsX = (8.27f * dpi).toInt()
+        val dotsY = (11.69f * dpi).toInt()
+
+        val compression = if (mode == ScanColorMode.MONOCHROME_PACKBITS) "RLENGTH" else "NONE"
+
+        val sb = StringBuilder()
+        sb.append("\u001BX\n")
+        sb.append("R=$dpi,$dpi\n")
+        sb.append("M=${mode.code}\n")
+        sb.append("C=$compression\n")
+        sb.append("B=50\n")
+        sb.append("N=50\n")
+        sb.append("U=OFF\n")
+        sb.append("P=OFF\n")
+        sb.append("A=0,0,$dotsX,$dotsY\n")
+
+        val asciiBytes = sb.toString().toByteArray(Charsets.US_ASCII)
+        val fullCmd = ByteArray(asciiBytes.size + 1)
+        System.arraycopy(asciiBytes, 0, fullCmd, 0, asciiBytes.size)
+        fullCmd[fullCmd.size - 1] = 0x80.toByte() // Brother Terminator marker
+
+        return fullCmd
+    }
+
+    private fun decodeColorJpegStream(data: ByteArray): Bitmap? {
+        // Search for SOI (0xFF, 0xD8)
         var startIndex = -1
         for (i in 0 until data.size - 1) {
             if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) {
@@ -154,19 +243,14 @@ class BrotherScanProtocol(
             }
         }
 
-        if (startIndex == -1) {
-            // Direct decode attempt
-            return BitmapFactory.decodeByteArray(data, 0, data.size)
-        }
-
-        return BitmapFactory.decodeByteArray(data, startIndex, data.size - startIndex)
+        val offset = if (startIndex >= 0) startIndex else 0
+        return BitmapFactory.decodeByteArray(data, offset, data.size - offset)
     }
 
     private fun decodeMonoPackBitsStream(data: ByteArray, resolution: ScanResolution): Bitmap? {
         val decompressed = PackBitsDecoder.decompress(data)
         if (decompressed.isEmpty()) return null
 
-        // Standard A4 width at target DPI: 8.27 inches * DPI
         val width = (8.27f * resolution.dpi).toInt()
         val height = ((decompressed.size * 8) / width).coerceAtLeast(1)
 
@@ -179,7 +263,7 @@ class BrotherScanProtocol(
             for (bit in 7 downTo 0) {
                 if (pixelIdx >= pixels.size) break
                 val isBlack = ((unsignedByte shr bit) and 1) == 0
-                pixels[pixelIdx++] = if (isBlack) -0x1000000 else -0x1 // 0xFF000000 vs 0xFFFFFFFF
+                pixels[pixelIdx++] = if (isBlack) -0x1000000 else -0x1
             }
         }
 
@@ -197,7 +281,6 @@ class BrotherScanProtocol(
         val limit = (width * height).coerceAtMost(data.size)
         for (i in 0 until limit) {
             val gray = data[i].toInt() and 0xFF
-            // 0xFF000000 | (gray << 16) | (gray << 8) | gray
             pixels[i] = (0xFF shl 24) or (gray shl 16) or (gray shl 8) or gray
         }
 
