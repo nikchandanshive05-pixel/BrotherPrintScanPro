@@ -204,7 +204,7 @@ class BrotherScanProtocol(
      * Executes QueryScanInfo (\x1bI\n) parameter negotiation matching libsane-brother4 QueryScanInfoProc.
      * The scanner requires parameter negotiation before accepting the \x1bX start command.
      */
-    private fun performParameterNegotiation(resolution: ScanResolution, mode: ScanColorMode): Boolean {
+    private suspend fun performParameterNegotiation(resolution: ScanResolution, mode: ScanColorMode): Boolean {
         try {
             val dpi = resolution.dpi
             val queryCmd = "\u001BI\nR=$dpi,$dpi\nM=${mode.code}\n\u0080".toByteArray(Charsets.US_ASCII)
