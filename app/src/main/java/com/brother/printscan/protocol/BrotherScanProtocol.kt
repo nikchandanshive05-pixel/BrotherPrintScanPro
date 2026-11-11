@@ -49,9 +49,9 @@ class BrotherScanProtocol(
      * Executes scan session with hardware handshaking, command transmission, and stream reception.
      * Follows the exact SANE brother4 sequence reverse-engineered from libsane-brother4.so.1.0.7:
      * 1. Handshake Loop: 0xC0 BREQ_GET_OPEN with recovery 0xC0 BREQ_GET_CLOSE.
-     * 2. Residual drain: Clears any leftover bytes on Endpoint IN 0x84.
+     * 2. Parameter Negotiation: Sends \x1bI\n query command and consumes the response completely.
      * 3. Start Command: Transmits \x1bX\n scan command to Bulk OUT Endpoint 0x03.
-     * 4. Motor Warmup: Waits 2s for lamp calibration and carriage motor movement.
+     * 4. Motor Warmup: Waits 2s for lamp calibration and carriage motor movement (sleep(3) in driver).
      * 5. Raster Reception: Streams data chunks from Bulk IN Endpoint 0x84 until scanner finishes.
      * 6. Block Dechunking: Unpacks brscan4 [tag, len_lo, len_hi] blocks into clean JPEG/PackBits.
      * 7. Session Teardown: Sends 0xC0 BREQ_GET_CLOSE.
@@ -70,18 +70,22 @@ class BrotherScanProtocol(
             Log.d(TAG, "Driver handshake loop result: $handshakeSuccess")
             onProgress(10)
 
-            // Step 2: Clear residual bytes on IN endpoint to ensure a clean channel
-            var drainedTotal = 0
-            val drainBuf = ByteArray(1024)
+            // Step 2: Negotiate Parameters via \x1bI\n Query Command
+            onProgress(15)
+            val negSuccess = performParameterNegotiation(resolution, mode)
+            Log.d(TAG, "Parameter negotiation result: $negSuccess")
+
+            // Fast drain of any residual bytes on IN endpoint before starting raster scan
+            val drainBuf = ByteArray(512)
+            var drained = 0
             while (true) {
                 val d = connection.bulkTransfer(endpointIn, drainBuf, drainBuf.size, 50)
                 if (d <= 0) break
-                drainedTotal += d
+                drained += d
             }
-            if (drainedTotal > 0) {
-                Log.d(TAG, "Drained $drainedTotal stale residual bytes before starting scan.")
+            if (drained > 0) {
+                Log.d(TAG, "Drained $drained extra residual bytes after negotiation.")
             }
-            onProgress(15)
 
             // Step 3: Build & Transmit Official brscan Start Command (\x1bX\n)
             val startCmd = buildBrScanStartCommand(resolution, mode)
@@ -189,6 +193,39 @@ class BrotherScanProtocol(
             tryCloseHandshake()
             ScanResult.Failure(err)
         }
+    }
+
+    /**
+     * Executes QueryScanInfo (\x1bI\n) parameter negotiation matching libsane-brother4 QueryScanInfoProc.
+     * The scanner requires parameter negotiation before accepting the \x1bX start command.
+     */
+    private fun performParameterNegotiation(resolution: ScanResolution, mode: ScanColorMode): Boolean {
+        try {
+            val dpi = resolution.dpi
+            val queryCmd = "\u001BI\nR=$dpi,$dpi\nM=${mode.code}\n\u0080".toByteArray(Charsets.US_ASCII)
+            val written = connection.bulkTransfer(endpointOut, queryCmd, queryCmd.size, 3000)
+            Log.d(TAG, "Parameter negotiation query (\u001BI) written: $written bytes")
+
+            if (written < 0) {
+                Log.w(TAG, "Failed to write parameter query command")
+                return false
+            }
+
+            // Read the query response (typically ~32 bytes ending in 0x80) with 5000ms timeout matching driver
+            val responseBuf = ByteArray(512)
+            val bytesRead = connection.bulkTransfer(endpointIn, responseBuf, responseBuf.size, 5000)
+            if (bytesRead > 0) {
+                val hexStr = responseBuf.take(bytesRead).joinToString(" ") { "%02X".format(it) }
+                val asciiStr = String(responseBuf, 0, bytesRead, Charsets.US_ASCII).replace("\u0080", "[80]")
+                Log.d(TAG, "Parameter negotiation response ($bytesRead bytes): $asciiStr (Hex: $hexStr)")
+                return true
+            } else {
+                Log.w(TAG, "Parameter negotiation read returned $bytesRead")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Parameter negotiation error: ${e.message}")
+        }
+        return false
     }
 
     /**
