@@ -174,7 +174,7 @@ class BrotherScanProtocol(
 
             // Step 6: Decode Raw Payload
             val bitmap = when (mode) {
-                ScanColorMode.TRUE_COLOR_JPEG -> decodeColorJpegStream(rawBytes)
+                ScanColorMode.TRUE_COLOR_JPEG -> decodeColorStream(rawBytes, resolution)
                 ScanColorMode.MONOCHROME_PACKBITS -> decodeMonoPackBitsStream(rawBytes, resolution)
                 ScanColorMode.GRAYSCALE -> decodeGrayscaleStream(rawBytes, resolution)
             }
@@ -316,8 +316,7 @@ class BrotherScanProtocol(
         when (mode) {
             ScanColorMode.TRUE_COLOR_JPEG -> {
                 sb.append("M=CGRAY\n")
-                sb.append("C=JPEG\n")
-                sb.append("J=MID\n")
+                sb.append("C=RLENGTH\n")
             }
             ScanColorMode.MONOCHROME_PACKBITS -> {
                 sb.append("M=TEXT\n")
@@ -397,37 +396,55 @@ class BrotherScanProtocol(
         return if (payload.isNotEmpty()) payload else rawBytes
     }
 
-    private fun decodeColorJpegStream(data: ByteArray): Bitmap? {
+    private fun decodeColorStream(data: ByteArray, resolution: ScanResolution): Bitmap? {
         val payload = dechunkBrotherBlocks(data)
 
-        // Find JPEG SOI marker 0xFF 0xD8
-        var startIndex = -1
+        // 1. Check if the payload is a valid JPEG image (starts with SOI marker 0xFF 0xD8)
+        var soiIndex = -1
         for (i in 0 until payload.size - 1) {
             if (payload[i] == 0xFF.toByte() && payload[i + 1] == 0xD8.toByte()) {
-                startIndex = i
+                soiIndex = i
                 break
             }
         }
 
-        val offset = if (startIndex >= 0) startIndex else 0
-        val length = payload.size - offset
-        Log.d(TAG, "Decoding JPEG: total bytes=${payload.size}, SOI offset=$offset, length=$length")
-
-        val bitmap = BitmapFactory.decodeByteArray(payload, offset, length)
-        if (bitmap == null) {
-            // Also try decoding the raw unmodified bytes in case framing differed
-            Log.w(TAG, "Dechunked JPEG decode returned null, trying raw bytes fallback...")
-            var rawSoi = -1
-            for (i in 0 until data.size - 1) {
-                if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte()) {
-                    rawSoi = i
-                    break
-                }
-            }
-            if (rawSoi >= 0) {
-                return BitmapFactory.decodeByteArray(data, rawSoi, data.size - rawSoi)
-            }
+        if (soiIndex >= 0) {
+            val length = payload.size - soiIndex
+            Log.d(TAG, "Decoding Color as JPEG: payload=${payload.size}, SOI offset=$soiIndex, length=$length")
+            val bitmap = BitmapFactory.decodeByteArray(payload, soiIndex, length)
+            if (bitmap != null) return bitmap
         }
+
+        // 2. Try PackBits decompression (lossless RLENGTH encoding for DCP-B7500D Mode 5)
+        val decompressed = PackBitsDecoder.decompress(payload)
+        val rasterBytes = if (decompressed.size > payload.size) decompressed else payload
+
+        val width = (8.27f * resolution.dpi).toInt()
+        val lineBytes = width * 3
+        val height = if (lineBytes > 0) (rasterBytes.size / lineBytes).coerceAtLeast(1) else 1
+
+        Log.d(TAG, "Decoding Color 24-bit RGB: width=$width, height=$height, bytes=${rasterBytes.size}")
+
+        if (rasterBytes.size < 3) {
+            Log.e(TAG, "Insufficient color raster data: ${rasterBytes.size} bytes")
+            return null
+        }
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(width * height)
+
+        var srcOffset = 0
+        val totalPixels = width * height
+        for (i in 0 until totalPixels) {
+            if (srcOffset + 2 >= rasterBytes.size) break
+            val r = rasterBytes[srcOffset].toInt() and 0xFF
+            val g = rasterBytes[srcOffset + 1].toInt() and 0xFF
+            val b = rasterBytes[srcOffset + 2].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            srcOffset += 3
+        }
+
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
         return bitmap
     }
 
