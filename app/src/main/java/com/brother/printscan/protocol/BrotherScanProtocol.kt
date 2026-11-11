@@ -119,15 +119,17 @@ class BrotherScanProtocol(
             val buffer = ByteArray(BUFFER_SIZE)
             var totalBytesRead = 0
             var consecutiveTimeouts = 0
+            var idleCycles = 0
             var scanning = true
 
             while (scanning) {
                 // Generous timeout while carriage motor warms up and calibrates
-                val timeoutMs = if (totalBytesRead < 1000) 15000 else 5000
+                val timeoutMs = if (totalBytesRead < 1000) 10000 else 4000
                 val bytesRead = connection.bulkTransfer(endpointIn, buffer, buffer.size, timeoutMs)
 
                 if (bytesRead > 0) {
                     consecutiveTimeouts = 0
+                    idleCycles = 0
                     totalBytesRead += bytesRead
                     rawStream.write(buffer, 0, bytesRead)
 
@@ -136,7 +138,6 @@ class BrotherScanProtocol(
                     onProgress(currentProgress)
 
                     // Check if device sent terminal marker in a short packet (Page End 0x80..0x86)
-                    // Only check after substantive data has been received to prevent aborting on initial status
                     if (bytesRead <= 4 && totalBytesRead > 2000) {
                         val firstByte = buffer[0].toInt() and 0xFF
                         if (firstByte in 0x80..0x86) {
@@ -146,17 +147,26 @@ class BrotherScanProtocol(
                         }
                     }
                 } else if (bytesRead == 0) {
-                    // Zero-length packet or USB bus idle - DO NOT treat as timeout or abort!
-                    delay(30)
-                } else {
-                    // bytesRead < 0 indicates a real USB timeout
-                    consecutiveTimeouts++
-                    Log.d(TAG, "Bulk read timed out (rc=$bytesRead, timeouts=$consecutiveTimeouts, total read=$totalBytesRead)")
-                    // Once substantive scan data has arrived (>20KB) and device goes silent for 2 consecutive cycles (10s), page is done
-                    if (totalBytesRead > 20000 && consecutiveTimeouts >= 2) {
+                    idleCycles++
+                    delay(50)
+                    // If no bytes or insufficient bytes arrive within 15s (300 cycles * 50ms)
+                    if (totalBytesRead <= 2000 && idleCycles >= 300) {
+                        val err = "Scanner did not respond (device busy or printer buffer full). Try turning printer OFF and ON."
+                        Log.e(TAG, err)
+                        scanning = false
+                    } else if (totalBytesRead > 2000 && idleCycles >= 80) {
+                        // Scanner finished sending raster data and went idle (4s silence after >2KB)
                         Log.d(TAG, "Scanner finished transmission ($totalBytesRead total bytes received).")
                         scanning = false
-                    } else if (totalBytesRead <= 20000 && consecutiveTimeouts >= 5) {
+                    }
+                } else {
+                    // bytesRead < 0 indicates USB timeout
+                    consecutiveTimeouts++
+                    Log.d(TAG, "Bulk read timed out (rc=$bytesRead, timeouts=$consecutiveTimeouts, total read=$totalBytesRead)")
+                    if (totalBytesRead > 2000 && consecutiveTimeouts >= 2) {
+                        Log.d(TAG, "Scanner finished transmission on timeout ($totalBytesRead total bytes received).")
+                        scanning = false
+                    } else if (totalBytesRead <= 2000 && consecutiveTimeouts >= 3) {
                         val err = "Timed out waiting for scanner carriage to return data."
                         Log.e(TAG, err)
                         scanning = false
@@ -172,7 +182,7 @@ class BrotherScanProtocol(
             tryCloseHandshake()
 
             if (rawBytes.isEmpty()) {
-                val err = "Zero bytes received from scanner on IN 0x${endpointIn.address.toString(16)}"
+                val err = "Zero bytes received from scanner on IN 0x${endpointIn.address.toString(16)}. Please power-cycle the printer (OFF and ON) to clear any pending buffers."
                 Log.e(TAG, err)
                 return@withContext ScanResult.Failure(err)
             }
