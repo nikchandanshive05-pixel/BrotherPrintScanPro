@@ -95,17 +95,26 @@ class BrotherPrintProtocol(
                 stream.write("\u001B%-12345X".toByteArray(Charsets.US_ASCII))
 
                 val jobData = stream.toByteArray()
-                Log.d(TAG, "Streaming page raster: ${jobData.size} bytes")
+                Log.d(TAG, "Streaming page raster: ${jobData.size} bytes to OUT 0x${endpointOut.address.toString(16)}")
 
-                // Transmit in chunks over USB Bulk Out
-                val chunkSize = 4096
+                // Clear endpoint halt before transmission
+                clearEndpointHalt(endpointOut.address)
+
+                // Transmit in 512-byte USB High-Speed standard chunks
+                val chunkSize = 512
                 var offset = 0
                 while (offset < jobData.size) {
                     val length = (jobData.size - offset).coerceAtMost(chunkSize)
                     val chunk = jobData.copyOfRange(offset, offset + length)
-                    val written = connection.bulkTransfer(endpointOut, chunk, length, USB_TIMEOUT_MS)
+                    var written = connection.bulkTransfer(endpointOut, chunk, length, USB_TIMEOUT_MS)
                     if (written < 0) {
-                        Log.e(TAG, "Bulk transfer error while printing")
+                        Log.w(TAG, "Bulk transfer failed (rc=$written) at offset $offset, clearing halt and retrying...")
+                        clearEndpointHalt(endpointOut.address)
+                        kotlinx.coroutines.delay(100)
+                        written = connection.bulkTransfer(endpointOut, chunk, length, USB_TIMEOUT_MS)
+                    }
+                    if (written < 0) {
+                        Log.e(TAG, "Bulk transfer fatal error while printing (rc=$written at offset $offset/${jobData.size})")
                         return@withContext false
                     }
                     offset += length
@@ -117,6 +126,14 @@ class BrotherPrintProtocol(
         } catch (e: Exception) {
             Log.e(TAG, "Print job failed", e)
             false
+        }
+    }
+
+    private fun clearEndpointHalt(endpointAddress: Int) {
+        try {
+            connection.controlTransfer(0x02, 0x01, 0x00, endpointAddress, null, 0, 1000)
+        } catch (e: Exception) {
+            Log.w(TAG, "clearEndpointHalt error: ${e.message}")
         }
     }
 }

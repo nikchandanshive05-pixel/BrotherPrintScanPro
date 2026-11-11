@@ -277,10 +277,12 @@ class BrotherUsbManager(private val context: Context) {
 
     /**
      * Claims printer interface for printing.
+     * Temporarily releases scanner interface so interface 0 has exclusive bus access.
      */
     fun claimPrinterInterface(): Boolean {
         val conn = activeConnection ?: return false
         val iface = printInterface ?: return false
+        scanInterface?.let { conn.releaseInterface(it) }
         return conn.claimInterface(iface, true)
     }
 
