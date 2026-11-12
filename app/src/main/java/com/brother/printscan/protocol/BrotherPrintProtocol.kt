@@ -37,14 +37,10 @@ class BrotherPrintProtocol(
                 val stream = ByteArrayOutputStream()
 
                 // Universal Brother / PJL initialization header
-                stream.write("\u001B%-12345X@PJL
-\n".toByteArray(Charsets.US_ASCII))
-                stream.write("@PJL SET JOBNAME = \"Mobile OTG Document\"
-\n".toByteArray(Charsets.US_ASCII))
-                stream.write("@PJL SET RESOLUTION = 300
-\n".toByteArray(Charsets.US_ASCII))
-                stream.write("@PJL ENTER LANGUAGE = RASTER
-\n".toByteArray(Charsets.US_ASCII))
+                stream.write("\u001B%-12345X@PJL\r\n".toByteArray(Charsets.US_ASCII))
+                stream.write("@PJL SET JOBNAME = \"Mobile OTG Document\"\r\n".toByteArray(Charsets.US_ASCII))
+                stream.write("@PJL SET RESOLUTION = 300\r\n".toByteArray(Charsets.US_ASCII))
+                stream.write("@PJL ENTER LANGUAGE = RASTER\r\n".toByteArray(Charsets.US_ASCII))
 
                 // Brother Raster Mode Initialization
                 stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x01)) // ESC i a (Switch to raster mode)
@@ -98,8 +94,7 @@ class BrotherPrintProtocol(
                 // Page Form Feed (0x0C)
                 stream.write(0x0C)
                 // PJL Job Terminate & End of Job
-                stream.write("\u001B%-12345X@PJL EOJ
-\n\u001B%-12345X".toByteArray(Charsets.US_ASCII))
+                stream.write("\u001B%-12345X@PJL EOJ\r\n\u001B%-12345X".toByteArray(Charsets.US_ASCII))
 
                 val jobData = stream.toByteArray()
                 Log.d(TAG, "Streaming page raster: ${jobData.size} bytes to OUT 0x${endpointOut.address.toString(16)}")
