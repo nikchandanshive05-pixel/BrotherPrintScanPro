@@ -179,14 +179,9 @@ class BrotherUsbManager(private val context: Context) {
             // Interface 1: Scanner (0x03 Bulk OUT, 0x84 Bulk IN)
             for (i in 0 until device.interfaceCount) {
                 val iface = device.getInterface(i)
+                val isPrinterClass = iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER
+                val isVendorClass = iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPECIFIC
                 epSummary.append("IF $i (Class ${iface.interfaceClass}): ")
-
-                if (iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER || i == 0) {
-                    printInterface = iface
-                }
-                if (iface.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPECIFIC || i == 1) {
-                    scanInterface = iface
-                }
 
                 for (j in 0 until iface.endpointCount) {
                     val ep = iface.getEndpoint(j)
@@ -196,17 +191,33 @@ class BrotherUsbManager(private val context: Context) {
                     epSummary.append("0x${ep.address.toString(16)} ")
 
                     if (isBulk) {
-                        // Match DCP-B7500D endpoints specifically (ext_20.ini: 132=0x84 IN, 3=0x03 OUT)
-                        if (ep.address == 0x84 || (i == 1 && isIn)) {
+                        // Match scanner endpoints (0x84 IN, 0x03 OUT or vendor interface)
+                        if (ep.address == UsbConstants.EP_SCAN_DATA_IN || (isVendorClass && isIn) || (i == 1 && isIn)) {
                             scanEndpointIn = ep
-                        } else if (ep.address == 0x03 || (i == 1 && !isIn)) {
+                            scanInterface = iface
+                        } else if (ep.address == UsbConstants.EP_SCAN_CMD_OUT || (isVendorClass && !isIn) || (i == 1 && !isIn)) {
                             scanEndpointOut = ep
-                        } else if (ep.address == 0x01 || (i == 0 && !isIn)) {
+                            scanInterface = iface
+                        }
+
+                        // Match printer endpoints (0x01 OUT or printer interface)
+                        if (ep.address == UsbConstants.EP_PRINT_OUT || (isPrinterClass && !isIn) || (i == 0 && !isIn)) {
                             printEndpointOut = ep
+                            printInterface = iface
                         }
                     }
                 }
                 epSummary.append(" | ")
+            }
+
+            // Fallback bindings if not assigned yet
+            if (printInterface == null && device.interfaceCount > 0) {
+                printInterface = device.getInterface(0)
+            }
+            if (scanInterface == null && device.interfaceCount > 1) {
+                scanInterface = device.getInterface(1)
+            } else if (scanInterface == null && device.interfaceCount > 0) {
+                scanInterface = device.getInterface(0)
             }
 
             val canScan = scanEndpointIn != null && scanEndpointOut != null

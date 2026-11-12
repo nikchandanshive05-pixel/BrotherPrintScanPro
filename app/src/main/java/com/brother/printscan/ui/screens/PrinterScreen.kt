@@ -61,7 +61,7 @@ fun PrinterScreen(
 
         // Select Document / Image
         Button(
-            onClick = { filePickerLauncher.launch("image/*") },
+            onClick = { filePickerLauncher.launch("*/*") },
             modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(8.dp)
         ) {

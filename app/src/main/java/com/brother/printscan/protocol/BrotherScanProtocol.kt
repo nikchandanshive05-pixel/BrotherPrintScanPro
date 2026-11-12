@@ -336,7 +336,8 @@ class BrotherScanProtocol(
         when (mode) {
             ScanColorMode.TRUE_COLOR_JPEG -> {
                 sb.append("M=CGRAY\n")
-                sb.append("C=RLENGTH\n")
+                sb.append("C=JPEG\n")
+                sb.append("J=MID\n")
             }
             ScanColorMode.MONOCHROME_PACKBITS -> {
                 sb.append("M=TEXT\n")
