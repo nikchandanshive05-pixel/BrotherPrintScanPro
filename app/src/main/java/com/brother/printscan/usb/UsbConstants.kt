@@ -14,6 +14,11 @@ object UsbConstants {
     const val USB_CLASS_PRINTER = 7
     const val USB_CLASS_VENDOR_SPECIFIC = 255
 
+    // USB Endpoints
+    const val EP_PRINT_OUT = 0x01
+    const val EP_SCAN_CMD_OUT = 0x03
+    const val EP_SCAN_DATA_IN = 0x84
+
     // Scan Control Codes
     const val STATUS_PAGE_END: Byte = 0x80.toByte()
     const val STATUS_NEXT_PAGE: Byte = 0x81.toByte()
