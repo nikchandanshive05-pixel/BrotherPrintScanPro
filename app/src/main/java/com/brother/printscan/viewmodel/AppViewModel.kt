@@ -212,4 +212,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    fun resetPrinter() {
+        val conn = usbManager.activeConnection
+        val outEp = usbManager.printEndpointOut
+        if (conn == null || outEp == null) {
+            _statusMessage.value = "Printer not connected over USB"
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                _isBusy.value = true
+                _statusMessage.value = "Sending PJL Reset signal to printer..."
+                usbManager.claimPrinterInterface()
+                val printProtocol = BrotherPrintProtocol(conn, outEp)
+                val ok = printProtocol.resetPrinter()
+                _statusMessage.value = if (ok) "Printer reset successfully! (Ready state)" else "Failed to reset printer"
+            } finally {
+                usbManager.claimScannerInterface()
+                _isBusy.value = false
+            }
+        }
+    }
 }

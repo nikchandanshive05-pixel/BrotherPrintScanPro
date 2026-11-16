@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
                                 progress = progress,
                                 statusMessage = statusMessage,
                                 onPrintBitmap = { bmp, copies -> viewModel.printCurrentPage(bmp, copies) },
+                                onResetPrinter = { viewModel.resetPrinter() },
                                 onBack = { currentScreen = NavigationTarget.HOME }
                             )
                         }

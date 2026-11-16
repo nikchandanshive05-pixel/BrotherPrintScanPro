@@ -68,12 +68,24 @@ class BrotherScanProtocol(
             // Step 1: Execute Brother Driver Handshake Loop
             val handshakeSuccess = performDriverHandshakeLoop()
             Log.d(TAG, "Driver handshake loop result: $handshakeSuccess")
+            if (!handshakeSuccess) {
+                val err = "Scanner handshake failed: Printer is busy or locked in print mode. Please tap 'Reset Printer' or turn printer OFF and ON."
+                Log.e(TAG, err)
+                tryCloseHandshake()
+                return@withContext ScanResult.Failure(err)
+            }
             onProgress(10)
 
             // Step 2: Negotiate Parameters via \x1bI\n Query Command
             onProgress(15)
             val negSuccess = performParameterNegotiation(resolution, mode)
             Log.d(TAG, "Parameter negotiation result: $negSuccess")
+            if (!negSuccess) {
+                val err = "Scanner parameter negotiation failed. Please re-plug the USB OTG cable."
+                Log.e(TAG, err)
+                tryCloseHandshake()
+                return@withContext ScanResult.Failure(err)
+            }
 
             // Fast drain of any residual bytes on IN endpoint before starting raster scan
             val drainBuf = ByteArray(512)
@@ -138,7 +150,7 @@ class BrotherScanProtocol(
                     onProgress(currentProgress)
 
                     // Check if device sent terminal marker in a short packet (Page End 0x80..0x86)
-                    if (bytesRead <= 4 && totalBytesRead > 2000) {
+                    if (bytesRead <= 4 && totalBytesRead > 50000) {
                         val firstByte = buffer[0].toInt() and 0xFF
                         if (firstByte in 0x80..0x86) {
                             Log.d(TAG, "Detected standalone Page End marker (0x${firstByte.toString(16)}) in short packet ($bytesRead bytes). Scan complete!")
@@ -150,12 +162,12 @@ class BrotherScanProtocol(
                     idleCycles++
                     delay(50)
                     // If no bytes or insufficient bytes arrive within 15s (300 cycles * 50ms)
-                    if (totalBytesRead <= 2000 && idleCycles >= 300) {
+                    if (totalBytesRead <= 20000 && idleCycles >= 300) {
                         val err = "Scanner did not respond (device busy or printer buffer full). Try turning printer OFF and ON."
                         Log.e(TAG, err)
                         scanning = false
-                    } else if (totalBytesRead > 2000 && idleCycles >= 80) {
-                        // Scanner finished sending raster data and went idle (4s silence after >2KB)
+                    } else if (totalBytesRead > 20000 && idleCycles >= 80) {
+                        // Scanner finished sending raster data and went idle (4s silence after >20KB)
                         Log.d(TAG, "Scanner finished transmission ($totalBytesRead total bytes received).")
                         scanning = false
                     }
@@ -163,10 +175,10 @@ class BrotherScanProtocol(
                     // bytesRead < 0 indicates USB timeout
                     consecutiveTimeouts++
                     Log.d(TAG, "Bulk read timed out (rc=$bytesRead, timeouts=$consecutiveTimeouts, total read=$totalBytesRead)")
-                    if (totalBytesRead > 2000 && consecutiveTimeouts >= 2) {
+                    if (totalBytesRead > 20000 && consecutiveTimeouts >= 2) {
                         Log.d(TAG, "Scanner finished transmission on timeout ($totalBytesRead total bytes received).")
                         scanning = false
-                    } else if (totalBytesRead <= 2000 && consecutiveTimeouts >= 3) {
+                    } else if (totalBytesRead <= 20000 && consecutiveTimeouts >= 3) {
                         val err = "Timed out waiting for scanner carriage to return data."
                         Log.e(TAG, err)
                         scanning = false
@@ -181,8 +193,8 @@ class BrotherScanProtocol(
             // Step 5: Send close teardown
             tryCloseHandshake()
 
-            if (rawBytes.isEmpty()) {
-                val err = "Zero bytes received from scanner on IN 0x${endpointIn.address.toString(16)}. Please power-cycle the printer (OFF and ON) to clear any pending buffers."
+            if (rawBytes.size < 20000) {
+                val err = "Insufficient scan data received (${rawBytes.size} bytes). Carriage did not travel the flatbed. Please check USB connection and printer power."
                 Log.e(TAG, err)
                 return@withContext ScanResult.Failure(err)
             }
@@ -446,8 +458,8 @@ class BrotherScanProtocol(
 
         Log.d(TAG, "Decoding Color 24-bit RGB: width=$width, height=$height, bytes=${rasterBytes.size}")
 
-        if (rasterBytes.size < 3) {
-            Log.e(TAG, "Insufficient color raster data: ${rasterBytes.size} bytes")
+        if (rasterBytes.size < 20000) {
+            Log.e(TAG, "Insufficient color raster data: ${rasterBytes.size} bytes (minimum 20000 expected)")
             return null
         }
 
@@ -504,6 +516,10 @@ class BrotherScanProtocol(
 
     private fun decodeGrayscaleStream(data: ByteArray, resolution: ScanResolution): Bitmap? {
         val payload = dechunkBrotherBlocks(data)
+        if (payload.size < 20000) {
+            Log.e(TAG, "Insufficient grayscale data: ${payload.size} bytes (minimum 20000 expected)")
+            return null
+        }
         val width = (8.27f * resolution.dpi).toInt()
         val height = (payload.size / width).coerceAtLeast(1)
 

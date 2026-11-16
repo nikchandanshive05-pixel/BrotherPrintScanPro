@@ -31,6 +31,7 @@ fun PrinterScreen(
     progress: Int,
     statusMessage: String?,
     onPrintBitmap: (Bitmap, Int) -> Unit,
+    onResetPrinter: () -> Unit = {},
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -134,6 +135,15 @@ fun PrinterScreen(
             Icon(Icons.Default.Print, contentDescription = null)
             Spacer(Modifier.width(8.dp))
             Text("Print via OTG USB", fontWeight = FontWeight.Bold)
+        }
+
+        OutlinedButton(
+            onClick = onResetPrinter,
+            modifier = Modifier.fillMaxWidth().height(44.dp),
+            enabled = !isBusy,
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text("Clear Printer Buffer (Cancel Stuck Jobs)")
         }
 
         OutlinedButton(
