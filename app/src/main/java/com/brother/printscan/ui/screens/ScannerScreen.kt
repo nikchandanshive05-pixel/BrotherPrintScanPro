@@ -20,7 +20,7 @@ fun ScannerScreen(
     onBack: () -> Unit
 ) {
     var selectedDpi by remember { mutableStateOf(ScanResolution.DPI_300) }
-    var selectedMode by remember { mutableStateOf(ScanColorMode.TRUE_COLOR_JPEG) }
+    var selectedMode by remember { mutableStateOf(ScanColorMode.TRUE_COLOR) }
 
     Column(
         modifier = Modifier
@@ -80,7 +80,7 @@ fun ScannerScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     listOf(
-                        ScanColorMode.TRUE_COLOR_JPEG to "24-bit Color",
+                        ScanColorMode.TRUE_COLOR to "24-bit Color",
                         ScanColorMode.GRAYSCALE to "Grayscale",
                         ScanColorMode.MONOCHROME_PACKBITS to "Mono B&W"
                     ).forEach { (mode, label) ->
